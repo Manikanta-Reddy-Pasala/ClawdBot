@@ -22,6 +22,7 @@ scp "${LOCAL_DIR}/requirements.txt" \
     "${LOCAL_DIR}/task_queue.py" \
     "${LOCAL_DIR}/context_manager.py" \
     "${LOCAL_DIR}/executor.py" \
+    "${LOCAL_DIR}/agents.py" \
     "${LOCAL_DIR}/bot.py" \
     "${LOCAL_DIR}/tools.py" \
     "${LOCAL_DIR}/shell_executor.py" \
@@ -38,7 +39,7 @@ ssh root@${SERVER} "test -f ${REMOTE_DIR}/.env || echo 'NO_ENV'" | grep -q "NO_E
 
 # Step 4: Remove old files that are no longer needed
 echo "[4/6] Cleaning up old files..."
-ssh root@${SERVER} "rm -f ${REMOTE_DIR}/ai_router.py ${REMOTE_DIR}/claude_client.py ${REMOTE_DIR}/conversation_store.py ${REMOTE_DIR}/gemini_client.py"
+ssh root@${SERVER} "rm -f ${REMOTE_DIR}/ai_router.py ${REMOTE_DIR}/claude_client.py ${REMOTE_DIR}/conversation_store.py ${REMOTE_DIR}/gemini_client.py ${REMOTE_DIR}/gmail_tools.py ${REMOTE_DIR}/job_tools.py ${REMOTE_DIR}/job_profile.json"
 
 # Step 5: Install Python dependencies
 echo "[5/6] Installing Python dependencies..."
