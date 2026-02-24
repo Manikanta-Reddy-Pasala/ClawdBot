@@ -78,9 +78,11 @@ Built-in context: `vm` (default, `/opt/clawdbot`). Repos in `/opt/clawdbot/repos
 
 | Command | Description |
 |---------|-------------|
-| `/start` | Show help |
+| `/start` | Welcome message |
+| `/help` | Show all commands |
 | `/ctx <name>` | Switch context (working directory) |
-| `/contexts` | List available contexts |
+| `/ctx list` | List all available contexts |
+| `/ctx` | Show current context |
 | `/newctx <name> [path]` | Create custom context |
 | `/rmctx <name>` | Remove custom context |
 | `/task <prompt>` | Force multi-agent pipeline |

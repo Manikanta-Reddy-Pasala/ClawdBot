@@ -41,26 +41,39 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ctx = ctx_mgr.get_active_context(update.effective_chat.id)
     await update.message.reply_text(
         f"ClawdBot v2 online. Context: *{ctx}*\n\n"
-        "Just send a message and I'll queue it for execution.\n\n"
-        "Commands:\n"
-        "/ctx <name> - switch context\n"
-        "/contexts - list available contexts\n"
-        "/newctx <name> <path> - create context\n"
-        "/rmctx <name> - remove custom context\n"
-        "/stop - kill running task in current context\n"
-        "/clear - clear conversation history\n"
-        "/q <task> - queue task silently\n"
-        "/task <prompt> - force multi-agent pipeline\n"
-        "/tasks - show recent tasks\n"
-        "/status - show current state\n"
-        "/shell <cmd> - run shell command directly",
+        "Send a message and I'll queue it for Claude.\n"
+        "Type /help for commands.",
         parse_mode="Markdown",
     )
 
 
-async def cmd_contexts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id):
         return
+    await update.message.reply_text(
+        "*Commands:*\n\n"
+        "*Context:*\n"
+        "/ctx <name> - switch context\n"
+        "/ctx list - list all contexts\n"
+        "/ctx - show current context\n"
+        "/newctx <name> [path] - create context\n"
+        "/rmctx <name> - remove context\n\n"
+        "*Tasks:*\n"
+        "/task <prompt> - multi-agent pipeline\n"
+        "/q <prompt> - queue task silently\n"
+        "/tasks - recent tasks\n"
+        "/status - running tasks & queue\n"
+        "/stop - kill current task\n"
+        "/clear - reset conversation\n\n"
+        "*Misc:*\n"
+        "/shell <cmd> - run shell command\n"
+        "/help - this message",
+        parse_mode="Markdown",
+    )
+
+
+async def _show_contexts(update: Update):
+    """List all available contexts."""
     available = ctx_mgr.get_available_contexts()
     custom = ctx_mgr.get_custom_contexts()
     active = ctx_mgr.get_active_context(update.effective_chat.id)
@@ -137,10 +150,14 @@ async def cmd_ctx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         current = ctx_mgr.get_active_context(update.effective_chat.id)
-        await update.message.reply_text(f"Current context: *{current}*\nUsage: /ctx <name>", parse_mode="Markdown")
+        await update.message.reply_text(f"Current context: *{current}*\nUsage: /ctx <name> or /ctx list", parse_mode="Markdown")
         return
 
     name = args[0].strip()
+
+    if name.lower() == "list":
+        await _show_contexts(update)
+        return
     available = ctx_mgr.get_available_contexts()
 
     # Fuzzy match: case-insensitive prefix match
@@ -364,9 +381,8 @@ def main():
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ctx", cmd_ctx))
-    app.add_handler(CommandHandler("contexts", cmd_contexts))
     app.add_handler(CommandHandler("newctx", cmd_newctx))
     app.add_handler(CommandHandler("rmctx", cmd_rmctx))
     app.add_handler(CommandHandler("stop", cmd_stop))
