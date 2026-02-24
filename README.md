@@ -87,7 +87,8 @@ Built-in context: `vm` (default, `/opt/clawdbot`). Repos in `/opt/clawdbot/repos
 | `/rmctx <name>` | Remove custom context |
 | `/task <prompt>` | Force multi-agent pipeline |
 | `/q <prompt>` | Queue task silently (no status message) |
-| `/stop` | Kill running task + cancel pending in current context |
+| `/stop` | Kill the currently running task |
+| `/stopall` | Kill running task + cancel all pending in context |
 | `/clear` | Clear conversation history and session |
 | `/tasks` | Show 10 most recent tasks |
 | `/status` | Show running tasks and queue depth |

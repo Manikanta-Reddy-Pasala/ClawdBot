@@ -63,7 +63,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/q <prompt> - queue task silently\n"
         "/tasks - recent tasks\n"
         "/status - running tasks & queue\n"
-        "/stop - kill current task\n"
+        "/stop - kill running task\n"
+        "/stopall - kill running + cancel pending\n"
         "/clear - reset conversation\n\n"
         "*Misc:*\n"
         "/shell <cmd> - run shell command\n"
@@ -191,6 +192,24 @@ async def cmd_ctx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop only the currently running task in the active context."""
+    if not is_authorized(update.effective_user.id):
+        return
+    ctx = ctx_mgr.get_active_context(update.effective_chat.id)
+
+    if not executor:
+        await update.message.reply_text("Executor not ready.")
+        return
+
+    stopped = await executor.stop_context(ctx)
+    if stopped:
+        await update.message.reply_text(f"Stopped running task in {ctx}.")
+    else:
+        await update.message.reply_text(f"Nothing running in {ctx}.")
+
+
+async def cmd_stopall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop running task + cancel all pending tasks in the active context."""
     if not is_authorized(update.effective_user.id):
         return
     ctx = ctx_mgr.get_active_context(update.effective_chat.id)
@@ -386,6 +405,7 @@ def main():
     app.add_handler(CommandHandler("newctx", cmd_newctx))
     app.add_handler(CommandHandler("rmctx", cmd_rmctx))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("stopall", cmd_stopall))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("q", cmd_queue))
     app.add_handler(CommandHandler("task", cmd_task))
