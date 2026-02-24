@@ -22,9 +22,5 @@ class Config:
     DB_PATH: str = os.environ.get("DB_PATH", "/opt/clawdbot/conversations.db")
     REPOS_DIR: str = os.environ.get("REPOS_DIR", "/opt/clawdbot/repos")
 
-    # Gmail (for email management) - used by gmail_tools.py
-    GMAIL_ADDRESS: str = os.environ.get("GMAIL_ADDRESS", "")
-    GMAIL_APP_PASSWORD: str = os.environ.get("GMAIL_APP_PASSWORD", "")
-
 
 config = Config()

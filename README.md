@@ -155,7 +155,6 @@ ClawdBot/
 ├── config.py           # Environment variable loading
 ├── tools.py            # Tool call description formatting for status updates
 ├── shell_executor.py   # Direct shell command execution with safety checks
-├── gmail_tools.py      # Gmail management (stats, search, bulk clean)
 ├── requirements.txt    # Python dependencies
 ├── deploy.sh           # SSH deploy script
 ├── clawdbot.service    # systemd unit file
