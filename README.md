@@ -5,55 +5,39 @@ A Telegram bot that wraps [Claude Code CLI](https://docs.anthropic.com/en/docs/c
 ## How It Works
 
 ```
-Telegram message
+Telegram message (text, photo, or document)
       │
       ▼
    bot.py ──► task_queue (SQLite) ──► executor
                                         │
-                              ┌─────────┴─────────┐
-                              │                    │
-                         Simple task          Complex task
-                              │                    │
-                        Raw CLI subprocess    Agent SDK
-                        (claude -p ...)       (multi-agent)
-                              │                    │
-                              ▼                    ▼
-                        Single Claude        Orchestrator Claude
-                        with tools           delegates to sub-agents:
-                              │                planner → architect
-                              │                → coder → tester
-                              │                → reviewer
-                              │                    │
-                              └────────┬───────────┘
-                                       ▼
-                              Result sent to Telegram
+                                   Agent SDK (default)
+                                   claude-agent-sdk
+                                        │
+                                   Orchestrator Claude
+                                   delegates to sub-agents:
+                                     planner → architect
+                                     → coder → tester
+                                     → reviewer
+                                        │
+                                   Raw CLI fallback
+                                   (if SDK unavailable)
+                                        │
+                                        ▼
+                               Result sent to Telegram
 ```
 
 ### Message Flow
 
-1. **User sends message** in Telegram (or `/task`, `/q` commands)
-2. **bot.py** authenticates the user, resolves the active context (working directory), sends a "Thinking..." status message, and queues the task in SQLite
+1. **User sends message** in Telegram — text, photo, or document (with optional caption)
+2. **bot.py** authenticates the user, resolves the active context (working directory), downloads any attachments, sends a status message, and queues the task in SQLite
 3. **Executor** polls for pending tasks every 2 seconds. One task per context runs at a time; others queue
-4. **Routing decision** — the executor decides which path to use:
-   - **Fast path** (raw CLI): simple messages go through `claude -p` subprocess with `--resume` for session continuity
-   - **Multi-agent path** (Agent SDK): complex tasks use `claude-agent-sdk` with 5 specialized sub-agents
-5. **Progress streaming** — tool calls and agent delegations are streamed as Telegram status updates
+4. **Agent SDK execution** — all tasks use `claude-agent-sdk` with 5 specialized sub-agents. If the SDK isn't installed or fails mid-run, it falls back to raw CLI subprocess automatically
+5. **Live status** — tool calls and agent delegations are streamed as Telegram status updates with elapsed time. A heartbeat updates the status every 10 seconds even during long-running operations
 6. **Result** — final response is sent back to Telegram, status message is deleted, session ID is saved for `--resume`
 
-### Two Execution Modes
+### Execution
 
-#### Fast Path — Raw CLI Subprocess
-
-For most messages. Spawns `claude -p "<prompt>" --output-format stream-json --verbose` as a subprocess. Parses the JSON stream for tool calls (displayed as status updates) and the final result. Uses `--resume <session_id>` to maintain conversation context across messages.
-
-#### Multi-Agent Path — Claude Agent SDK
-
-For complex tasks that benefit from specialized agents. Triggered by:
-
-- **Manual**: `/task <prompt>` command (always uses multi-agent)
-- **Auto-detect**: Keyword + length heuristic (e.g., "implement X with Y", "plan and build", "refactor entire") — no extra LLM call
-
-The orchestrator Claude sees 5 sub-agent definitions and delegates via the `Task` tool:
+All messages go through the Agent SDK path by default. The orchestrator Claude sees 5 sub-agent definitions and delegates via the `Task` tool:
 
 | Agent | Tools | Purpose |
 |-------|-------|---------|
@@ -63,7 +47,19 @@ The orchestrator Claude sees 5 sub-agent definitions and delegates via the `Task
 | tester | Bash, Read, Glob, Grep | Run tests, validate |
 | reviewer | Read, Glob, Grep | Code review, security check |
 
-If the SDK isn't installed or fails mid-run, it falls back to the fast path automatically.
+**Fallback**: If the SDK isn't installed or crashes mid-run, the executor automatically falls back to raw `claude -p` subprocess with `--resume` for session continuity.
+
+### Status Updates
+
+While a task runs, the Telegram status message shows:
+- **Elapsed time** — `[#42] 2m 35s`
+- **Agent pipeline** — `planner > coder > tester`
+- **Current activity** — last tool call or agent delegation
+- **Heartbeat** — updates every 10 seconds even during long operations (e.g., docker builds, SSH commands)
+
+### Attachments
+
+Photos and documents sent in Telegram are downloaded to the server and their file paths are included in the prompt so Claude can read/analyze them directly.
 
 ### Contexts
 
@@ -85,7 +81,7 @@ Built-in context: `vm` (default, `/opt/clawdbot`). Repos in `/opt/clawdbot/repos
 | `/ctx` | Show current context |
 | `/newctx <name> [path]` | Create custom context |
 | `/rmctx <name>` | Remove custom context |
-| `/task <prompt>` | Force multi-agent pipeline |
+| `/task <prompt>` | Force multi-agent pipeline (same as regular message) |
 | `/q <prompt>` | Queue task silently (no status message) |
 | `/stop` | Kill the currently running task |
 | `/stopall` | Kill running task + cancel all pending in context |
@@ -150,8 +146,8 @@ The deploy script SSHs into the server, copies files, installs dependencies in a
 
 ```
 ClawdBot/
-├── bot.py              # Telegram handlers, command routing
-├── executor.py         # Task execution — raw CLI + multi-agent paths
+├── bot.py              # Telegram handlers, command routing, attachment downloads
+├── executor.py         # Task execution — Agent SDK + CLI fallback, heartbeat status
 ├── agents.py           # Sub-agent definitions (planner, architect, coder, tester, reviewer)
 ├── task_queue.py       # SQLite-backed task queue with status tracking
 ├── context_manager.py  # Working directories, session IDs, conversation history
@@ -174,4 +170,4 @@ Each (chat_id, context) pair stores a Claude CLI session ID in SQLite. When the 
 - **User allowlist**: Only Telegram user IDs in `ALLOWED_USER_IDS` can interact
 - **Shell blocklist**: Destructive commands (`rm -rf /`, `mkfs`, `dd`, `shutdown`, etc.) are blocked
 - **No API key exposure**: `ANTHROPIC_API_KEY` is stripped from the subprocess environment so Claude CLI uses Max subscription OAuth instead
-- **Permission bypass**: Multi-agent mode uses `bypassPermissions` since the bot runs unattended — the CLAUDE.md system prompt constrains behavior (never auto-commit, confirm before destructive ops)
+- **Permission bypass**: Uses `bypassPermissions` since the bot runs unattended — the CLAUDE.md system prompt constrains behavior (never auto-commit, confirm before destructive ops)

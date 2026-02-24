@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import signal
 
 from task_queue import TaskQueue, TaskStatus
@@ -14,29 +13,18 @@ logger = logging.getLogger("clawdbot.executor")
 
 POLL_INTERVAL = 2  # seconds
 
-# Keywords/patterns that suggest a complex, multi-step task
-_MULTI_AGENT_PATTERNS = [
-    r"\b(implement|build|create|develop|design)\b.*\b(with|and|including)\b",
-    r"\b(plan\s+and\s+(implement|build|code))",
-    r"\b(refactor|rewrite|redesign)\b.*\b(entire|whole|complete|all)\b",
-    r"\b(add\s+feature|new\s+feature)\b",
-    r"\b(fix|debug)\b.*\b(and\s+(test|verify|validate))\b",
-    r"\b(review\s+and\s+(fix|improve))\b",
-    r"\b(end.to.end|e2e|full.stack)\b",
-]
-_MULTI_AGENT_RE = re.compile("|".join(_MULTI_AGENT_PATTERNS), re.IGNORECASE)
-_MIN_COMPLEX_LENGTH = 80  # prompts shorter than this are unlikely to need multi-agent
-
 
 class Executor:
     def __init__(self, task_queue: TaskQueue, context_mgr: ContextManager, bot_app):
         self.queue = task_queue
         self.ctx_mgr = context_mgr
         self.bot_app = bot_app
-        # context -> asyncio.subprocess.Process
+        # context -> asyncio.subprocess.Process (CLI fallback path)
         self._running_procs: dict[str, asyncio.subprocess.Process] = {}
         # context -> task_id
         self._running_tasks: dict[str, int] = {}
+        # context -> asyncio.Task (so we can cancel SDK runs)
+        self._running_async_tasks: dict[str, asyncio.Task] = {}
         self._stopped = False
 
     async def start(self):
@@ -62,19 +50,12 @@ class Executor:
         self._running_tasks[task.context] = task.id
 
         # Fire and forget - run in background so we can poll for more tasks
-        asyncio.create_task(self._execute_task(task))
+        atask = asyncio.create_task(self._execute_task(task))
+        self._running_async_tasks[task.context] = atask
 
     def _should_use_multi_agent(self, task) -> bool:
-        """Heuristic: decide if a task warrants multi-agent orchestration."""
-        if not SDK_AVAILABLE:
-            return False
-        # Explicit flag from /task command
-        if task.multi_agent:
-            return True
-        # Auto-detect: keyword + length heuristic (no LLM call)
-        if len(task.prompt) >= _MIN_COMPLEX_LENGTH and _MULTI_AGENT_RE.search(task.prompt):
-            return True
-        return False
+        """Use multi-agent (SDK) for all tasks when available, CLI as fallback."""
+        return SDK_AVAILABLE
 
     async def _execute_task(self, task):
         try:
@@ -109,13 +90,15 @@ class Executor:
         finally:
             self._running_procs.pop(task.context, None)
             self._running_tasks.pop(task.context, None)
+            self._running_async_tasks.pop(task.context, None)
 
     async def _run_multi_agent(self, task):
         """Run task using claude-agent-sdk with sub-agent orchestration."""
         from claude_agent_sdk import (
             query, ClaudeAgentOptions, ResultMessage, SystemMessage,
-            AssistantMessage, TextBlock,
+            AssistantMessage,
         )
+        from claude_agent_sdk.types import ToolUseBlock
 
         working_dir = self.ctx_mgr.get_working_dir(task.context)
         session_id = self.ctx_mgr.get_session_id(task.chat_id, task.context)
@@ -125,7 +108,6 @@ class Executor:
             allowed_tools=["Bash(*)", "Read", "Write", "Edit", "Glob", "Grep", "Task"],
             permission_mode="bypassPermissions",
             agents=SUBAGENTS,
-            max_turns=60,
             setting_sources=["project"],
         )
 
@@ -136,49 +118,74 @@ class Executor:
         result_text = ""
         tools_used = []
         current_agent = None
-        agents_invoked = []  # track which agents were called, in order
+        agents_invoked = []
+        last_activity = "Starting orchestrator..."
+        start_time = asyncio.get_event_loop().time()
 
-        def _build_status(activity: str) -> str:
-            header = f"[#{task.id}] Multi-agent"
+        def _elapsed() -> str:
+            secs = int(asyncio.get_event_loop().time() - start_time)
+            if secs < 60:
+                return f"{secs}s"
+            return f"{secs // 60}m {secs % 60}s"
+
+        def _build_status() -> str:
+            header = f"[#{task.id}] {_elapsed()}"
             if agents_invoked:
-                agent_list = " > ".join(agents_invoked)
-                header += f"\nAgents: {agent_list}"
-            return f"{header}\n{activity}"
+                header += f" | {' > '.join(agents_invoked)}"
+            return f"{header}\n{last_activity}"
+
+        # Heartbeat: update status every 10s so user knows it's alive
+        heartbeat_running = True
+
+        async def _heartbeat():
+            while heartbeat_running:
+                await asyncio.sleep(10)
+                if heartbeat_running:
+                    await self._update_status(task, _build_status())
+
+        heartbeat_task = asyncio.create_task(_heartbeat())
 
         try:
+            msg_count = 0
             async for message in query(prompt=task.prompt, options=opts):
+                msg_count += 1
+
                 if isinstance(message, SystemMessage):
                     if message.subtype == "init":
-                        new_session_id = message.session_id
+                        new_session_id = message.data.get("session_id")
+                        logger.info(f"Task #{task.id} init session: {new_session_id}")
 
                 elif isinstance(message, AssistantMessage):
                     for block in message.content:
-                        if hasattr(block, "type") and block.type == "tool_use":
-                            name = getattr(block, "name", "")
-                            tools_used.append(name)
-                            # Detect sub-agent delegation
-                            if name == "Task":
-                                input_data = getattr(block, "input", {})
-                                agent_type = input_data.get("subagent_type", "")
-                                desc = input_data.get("description", "")
+                        if isinstance(block, ToolUseBlock):
+                            tools_used.append(block.name)
+                            if block.name == "Task":
+                                agent_type = block.input.get("subagent_type", "")
+                                desc = block.input.get("description", "")
                                 if agent_type:
                                     current_agent = agent_type
                                     agents_invoked.append(agent_type)
-                                    await self._update_status(
-                                        task, _build_status(f"  > {agent_type}: {desc}")
-                                    )
+                                    last_activity = f"  > {agent_type}: {desc}"
                             else:
-                                input_data = getattr(block, "input", {})
-                                desc = describe_tool_call(name, input_data)
+                                desc = describe_tool_call(block.name, block.input)
                                 prefix = f"{current_agent}: " if current_agent else ""
-                                await self._update_status(
-                                    task, _build_status(f"  > {prefix}{desc}")
-                                )
+                                last_activity = f"  > {prefix}{desc}"
+                            await self._update_status(task, _build_status())
 
                 elif isinstance(message, ResultMessage):
-                    result_text = message.result
+                    result_text = message.result or ""
                     if not new_session_id:
-                        new_session_id = getattr(message, "session_id", None)
+                        new_session_id = message.session_id
+
+            logger.info(f"Task #{task.id} multi-agent done: {msg_count} msgs, {len(tools_used)} tools, agents: {agents_invoked}")
+
+        finally:
+            heartbeat_running = False
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
 
         except Exception as e:
             # If SDK fails mid-run, fall back to raw CLI
@@ -243,13 +250,37 @@ class Executor:
         )
         self._running_procs[task.context] = proc
 
-        # Update status message to show executing
-        await self._update_status(task, f"[#{task.id}] Single agent\nExecuting...")
-
         tools_used = []
         result_text = ""
         tool_log = []
         new_session_id = None
+        cli_start = asyncio.get_event_loop().time()
+        last_cli_activity = "Executing..."
+
+        def _cli_elapsed() -> str:
+            secs = int(asyncio.get_event_loop().time() - cli_start)
+            if secs < 60:
+                return f"{secs}s"
+            return f"{secs // 60}m {secs % 60}s"
+
+        def _cli_status() -> str:
+            lines = tool_log[-5:]
+            header = f"[#{task.id}] {_cli_elapsed()}"
+            if lines:
+                return header + "\n" + "\n".join(f"  > {t}" for t in lines)
+            return f"{header}\n{last_cli_activity}"
+
+        # Heartbeat for CLI path too
+        cli_heartbeat_running = True
+
+        async def _cli_heartbeat():
+            while cli_heartbeat_running:
+                await asyncio.sleep(10)
+                if cli_heartbeat_running:
+                    await self._update_status(task, _cli_status())
+
+        cli_hb_task = asyncio.create_task(_cli_heartbeat())
+        await self._update_status(task, _cli_status())
 
         async for raw_line in proc.stdout:
             line = raw_line.decode().strip()
@@ -272,13 +303,7 @@ class Executor:
                         tools_used.append(name)
                         desc = describe_tool_call(name, input_data)
                         tool_log.append(desc)
-                        # Update status with recent tool calls
-                        lines = tool_log[-5:]
-                        status_text = (
-                            f"[#{task.id}] Single agent\n"
-                            + "\n".join(f"  > {t}" for t in lines)
-                        )
-                        await self._update_status(task, status_text)
+                        await self._update_status(task, _cli_status())
 
             elif event.get("type") == "result":
                 result_text = event.get("result", "")
@@ -286,6 +311,14 @@ class Executor:
                     new_session_id = event.get("session_id")
 
         await proc.wait()
+
+        # Stop heartbeat
+        cli_heartbeat_running = False
+        cli_hb_task.cancel()
+        try:
+            await cli_hb_task
+        except asyncio.CancelledError:
+            pass
 
         if not result_text:
             stderr_data = await proc.stderr.read()
@@ -315,27 +348,36 @@ class Executor:
         await self._send_long_message(task.chat_id, f"*{tag}*\n{result_text}")
 
     async def stop_context(self, context: str) -> bool:
-        proc = self._running_procs.get(context)
-        if proc is None:
+        task_id = self._running_tasks.get(context)
+        if task_id is None:
             return False
 
-        task_id = self._running_tasks.get(context)
-
-        try:
-            proc.send_signal(signal.SIGTERM)
+        # Kill tracked subprocess (CLI fallback path)
+        proc = self._running_procs.get(context)
+        if proc is not None:
             try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-        except ProcessLookupError:
-            pass
+                proc.send_signal(signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+            except ProcessLookupError:
+                pass
 
-        if task_id:
-            self.queue.set_cancelled(task_id)
+        # Cancel the asyncio task (kills SDK-spawned processes too)
+        atask = self._running_async_tasks.get(context)
+        if atask is not None and not atask.done():
+            atask.cancel()
+            try:
+                await asyncio.wait_for(atask, timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
 
+        self.queue.set_cancelled(task_id)
         self._running_procs.pop(context, None)
         self._running_tasks.pop(context, None)
+        self._running_async_tasks.pop(context, None)
         return True
 
     def is_context_busy(self, context: str) -> bool:
