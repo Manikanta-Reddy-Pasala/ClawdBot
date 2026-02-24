@@ -226,7 +226,7 @@ class Executor:
             "-p", task.prompt,
             "--output-format", "stream-json",
             "--verbose",
-            "--allowedTools", "Bash(*),Read,Write,Edit,Glob,Grep",
+            "--dangerously-skip-permissions",
         ]
 
         # Resume existing session to maintain conversation context
