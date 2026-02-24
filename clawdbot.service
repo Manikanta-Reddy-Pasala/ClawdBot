@@ -1,0 +1,18 @@
+[Unit]
+Description=ClawdBot Telegram AI Assistant
+After=network.target
+
+[Service]
+Type=simple
+User=clawdbot
+Environment=HOME=/opt/clawdbot
+WorkingDirectory=/opt/clawdbot
+EnvironmentFile=/opt/clawdbot/.env
+ExecStart=/opt/clawdbot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

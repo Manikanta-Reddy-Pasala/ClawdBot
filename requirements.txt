@@ -1,0 +1,5 @@
+python-telegram-bot==21.6
+anthropic==0.77.0
+claude-agent-sdk
+python-dotenv==1.0.1
+psutil==6.1.0
