@@ -362,24 +362,75 @@ async def cmd_shell(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Main message handler ---
 
 
+async def _download_telegram_file(file_obj, filename: str) -> str:
+    """Download a Telegram file to /tmp/clawdbot/ and return the local path."""
+    import os
+    dl_dir = "/tmp/clawdbot"
+    os.makedirs(dl_dir, exist_ok=True)
+    local_path = os.path.join(dl_dir, filename)
+    await file_obj.download_to_drive(local_path)
+    return local_path
+
+
+async def _extract_files(update: Update) -> list[str]:
+    """Download any attached photos/documents and return local paths."""
+    paths = []
+
+    # Photo (Telegram sends multiple sizes, grab the largest)
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        file_obj = await photo.get_file()
+        ext = ".jpg"
+        path = await _download_telegram_file(file_obj, f"photo_{photo.file_unique_id}{ext}")
+        paths.append(path)
+
+    # Document (PDF, code files, etc.)
+    if update.message.document:
+        doc = update.message.document
+        file_obj = await doc.get_file()
+        filename = doc.file_name or f"file_{doc.file_unique_id}"
+        path = await _download_telegram_file(file_obj, filename)
+        paths.append(path)
+
+    return paths
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id):
         return
-    text = update.message.text
-    if not text:
+
+    text = update.message.text or update.message.caption or ""
+    has_files = update.message.photo or update.message.document
+
+    if not text and not has_files:
         return
 
     chat_id = update.effective_chat.id
     ctx = ctx_mgr.get_active_context(chat_id)
 
+    # Download any attached files
+    file_paths = []
+    if has_files:
+        try:
+            file_paths = await _extract_files(update)
+        except Exception as e:
+            logger.warning(f"Failed to download file: {e}")
+
+    # Build prompt with file references
+    prompt = text
+    if file_paths:
+        file_refs = "\n".join(f"- {p}" for p in file_paths)
+        file_note = f"\n\nAttached files (saved locally, use Read tool to view):\n{file_refs}"
+        prompt = (text + file_note) if text else f"Analyze these files:\n{file_refs}"
+
     # Send initial status message
     if executor and executor.is_context_busy(ctx):
         pending = task_queue.get_pending_count(ctx)
         status_msg = await update.message.reply_text(f"Queued in {ctx} ({pending + 1} ahead)")
-        task = task_queue.add(chat_id, ctx, text, status_message_id=status_msg.message_id)
+        task = task_queue.add(chat_id, ctx, prompt, status_message_id=status_msg.message_id)
     else:
         status_msg = await update.message.reply_text("Thinking...")
-        task = task_queue.add(chat_id, ctx, text, status_message_id=status_msg.message_id)
+        task = task_queue.add(chat_id, ctx, prompt, status_message_id=status_msg.message_id)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -413,7 +464,10 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("shell", cmd_shell))
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+        MessageHandler(
+            (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
+            handle_message,
+        )
     )
     app.add_error_handler(error_handler)
     app.post_init = post_init
