@@ -179,6 +179,15 @@ class Executor:
 
             logger.info(f"Task #{task.id} multi-agent done: {msg_count} msgs, {len(tools_used)} tools, agents: {agents_invoked}")
 
+        except Exception as e:
+            # If SDK fails mid-run, fall back to raw CLI
+            logger.warning(f"Task #{task.id} multi-agent failed, falling back to CLI: {e}")
+            await self._update_status(task, f"[#{task.id}] Falling back to single agent...")
+            heartbeat_running = False
+            heartbeat_task.cancel()
+            await self._run_claude(task)
+            return
+
         finally:
             heartbeat_running = False
             heartbeat_task.cancel()
@@ -186,13 +195,6 @@ class Executor:
                 await heartbeat_task
             except asyncio.CancelledError:
                 pass
-
-        except Exception as e:
-            # If SDK fails mid-run, fall back to raw CLI
-            logger.warning(f"Task #{task.id} multi-agent failed, falling back to CLI: {e}")
-            await self._update_status(task, f"[#{task.id}] Falling back to single agent...")
-            await self._run_claude(task)
-            return
 
         if not result_text:
             result_text = "No response from multi-agent execution."
