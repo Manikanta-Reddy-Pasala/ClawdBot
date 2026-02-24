@@ -124,7 +124,6 @@ class Executor:
             cwd=working_dir,
             allowed_tools=["Bash(*)", "Read", "Write", "Edit", "Glob", "Grep", "Task"],
             permission_mode="bypassPermissions",
-            allow_dangerously_skip_permissions=True,
             agents=SUBAGENTS,
             max_turns=60,
             setting_sources=["project"],
