@@ -207,11 +207,13 @@ class Executor:
 
         # Send final result
         tag = f"[#{task.id} | {task.context}]"
+        summary = ""
         if agents_invoked:
-            tag += f" ({', '.join(agents_invoked)})"
+            tag += " multi-agent"
+            summary = f"\n_Agents used: {' > '.join(agents_invoked)} ({len(tools_used)} tool calls)_\n"
         elif tools_used:
             tag += f" ({len(tools_used)} tools)"
-        await self._send_long_message(task.chat_id, f"*{tag}*\n{result_text}")
+        await self._send_long_message(task.chat_id, f"*{tag}*{summary}\n{result_text}")
 
     async def _run_claude(self, task):
         working_dir = self.ctx_mgr.get_working_dir(task.context)
