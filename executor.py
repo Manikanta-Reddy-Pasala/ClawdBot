@@ -78,9 +78,12 @@ class Executor:
 
     async def _execute_task(self, task):
         try:
-            if self._should_use_multi_agent(task):
+            use_multi = self._should_use_multi_agent(task)
+            if use_multi:
+                await self._update_status(task, f"[#{task.id}] Multi-agent mode\nStarting orchestrator...")
                 await self._run_multi_agent(task)
             else:
+                await self._update_status(task, f"[#{task.id}] Single agent\nExecuting...")
                 await self._run_claude(task)
         except asyncio.CancelledError:
             self.queue.set_cancelled(task.id)
@@ -130,12 +133,18 @@ class Executor:
         if session_id:
             opts.resume = session_id
 
-        await self._update_status(task, f"[#{task.id}] Multi-agent executing...")
-
         new_session_id = None
         result_text = ""
         tools_used = []
         current_agent = None
+        agents_invoked = []  # track which agents were called, in order
+
+        def _build_status(activity: str) -> str:
+            header = f"[#{task.id}] Multi-agent"
+            if agents_invoked:
+                agent_list = " > ".join(agents_invoked)
+                header += f"\nAgents: {agent_list}"
+            return f"{header}\n{activity}"
 
         try:
             async for message in query(prompt=task.prompt, options=opts):
@@ -155,20 +164,17 @@ class Executor:
                                 desc = input_data.get("description", "")
                                 if agent_type:
                                     current_agent = agent_type
-                                    status = (
-                                        f"[#{task.id}] Multi-agent\n"
-                                        f"  > {agent_type}: {desc}"
+                                    agents_invoked.append(agent_type)
+                                    await self._update_status(
+                                        task, _build_status(f"  > {agent_type}: {desc}")
                                     )
-                                    await self._update_status(task, status)
                             else:
                                 input_data = getattr(block, "input", {})
                                 desc = describe_tool_call(name, input_data)
-                                agent_prefix = f"{current_agent}: " if current_agent else ""
-                                status = (
-                                    f"[#{task.id}] Multi-agent\n"
-                                    f"  > {agent_prefix}{desc}"
+                                prefix = f"{current_agent}: " if current_agent else ""
+                                await self._update_status(
+                                    task, _build_status(f"  > {prefix}{desc}")
                                 )
-                                await self._update_status(task, status)
 
                 elif isinstance(message, ResultMessage):
                     result_text = message.result
@@ -201,9 +207,10 @@ class Executor:
 
         # Send final result
         tag = f"[#{task.id} | {task.context}]"
-        if tools_used:
-            agent_count = sum(1 for t in tools_used if t == "Task")
-            tag += f" ({len(tools_used)} tools, {agent_count} agents)"
+        if agents_invoked:
+            tag += f" ({', '.join(agents_invoked)})"
+        elif tools_used:
+            tag += f" ({len(tools_used)} tools)"
         await self._send_long_message(task.chat_id, f"*{tag}*\n{result_text}")
 
     async def _run_claude(self, task):
@@ -236,7 +243,7 @@ class Executor:
         self._running_procs[task.context] = proc
 
         # Update status message to show executing
-        await self._update_status(task, "Executing...")
+        await self._update_status(task, f"[#{task.id}] Single agent\nExecuting...")
 
         tools_used = []
         result_text = ""
@@ -267,7 +274,7 @@ class Executor:
                         # Update status with recent tool calls
                         lines = tool_log[-5:]
                         status_text = (
-                            f"[#{task.id}] Executing...\n"
+                            f"[#{task.id}] Single agent\n"
                             + "\n".join(f"  > {t}" for t in lines)
                         )
                         await self._update_status(task, status_text)
