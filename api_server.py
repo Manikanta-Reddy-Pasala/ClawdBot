@@ -439,7 +439,7 @@ async def _start_claude_stream(task_id: str, prompt: str):
     """Spawn claude CLI with stream-json output and collect events."""
     cmd = [
         "claude", "-p", "--output-format", "stream-json",
-        "--dangerously-skip-permissions",
+        "--verbose", "--dangerously-skip-permissions",
     ]
     env = os.environ.copy()
     env.pop("ANTHROPIC_API_KEY", None)
@@ -467,7 +467,20 @@ async def _start_claude_stream(task_id: str, prompt: str):
         proc.stdin.close()
 
         # Read stdout line by line (stream-json outputs one JSON per line)
+        # Format: {"type":"system",...}, {"type":"assistant","message":{"content":[...]},...},
+        #         {"type":"result","result":"..."}
         final_text_parts = []
+
+        async def _read_stderr():
+            """Read stderr in background to prevent pipe blocking."""
+            stderr_data = await proc.stderr.read()
+            if stderr_data:
+                err_msg = stderr_data.decode("utf-8", errors="replace").strip()
+                if err_msg:
+                    task["events"].append({"type": "error", "message": err_msg[:500], "ts": _ts()})
+
+        stderr_task = asyncio.create_task(_read_stderr())
+
         while True:
             line = await proc.stdout.readline()
             if not line:
@@ -483,60 +496,94 @@ async def _start_claude_stream(task_id: str, prompt: str):
 
             etype = evt.get("type", "")
 
-            if etype == "assistant" and evt.get("subtype") == "text":
-                # Claude's text output
-                final_text_parts.append(evt.get("text", ""))
-                task["events"].append({
-                    "type": "text",
-                    "message": evt.get("text", ""),
-                    "ts": _ts(),
-                })
-            elif etype == "tool_use":
-                tool_name = evt.get("tool", evt.get("name", ""))
-                tool_input = evt.get("input", {})
-                desc = ""
-                if isinstance(tool_input, dict):
-                    desc = tool_input.get("description", tool_input.get("command", tool_input.get("pattern", "")))
-                    if not desc and tool_input.get("file_path"):
-                        desc = f"Reading {tool_input['file_path']}"
-                task["events"].append({
-                    "type": "tool_use",
-                    "tool": tool_name,
-                    "message": f"{tool_name}: {desc}" if desc else tool_name,
-                    "ts": _ts(),
-                })
-            elif etype == "tool_result":
-                content = evt.get("content", evt.get("output", ""))
-                if isinstance(content, str) and len(content) > 500:
-                    content = content[:500] + "..."
-                task["events"].append({
-                    "type": "tool_result",
-                    "message": str(content)[:500] if content else "(empty)",
-                    "ts": _ts(),
-                })
+            if etype == "assistant":
+                # Parse nested message.content array
+                msg_obj = evt.get("message", {})
+                content_blocks = msg_obj.get("content", [])
+                for block in content_blocks:
+                    block_type = block.get("type", "")
+                    if block_type == "text":
+                        text = block.get("text", "")
+                        if text:
+                            final_text_parts.append(text)
+                            # Show truncated text in log
+                            display = text[:300] + "..." if len(text) > 300 else text
+                            task["events"].append({"type": "text", "message": display, "ts": _ts()})
+                    elif block_type == "tool_use":
+                        tool_name = block.get("name", "")
+                        tool_input = block.get("input", {})
+                        desc = ""
+                        if isinstance(tool_input, dict):
+                            desc = tool_input.get("description", tool_input.get("command", tool_input.get("pattern", "")))
+                            if not desc and tool_input.get("file_path"):
+                                desc = f"Reading {tool_input['file_path']}"
+                            if not desc and tool_input.get("query"):
+                                desc = tool_input["query"]
+                        task["events"].append({
+                            "type": "tool_use",
+                            "message": f"Tool: {tool_name} — {desc}" if desc else f"Tool: {tool_name}",
+                            "ts": _ts(),
+                        })
+                    elif block_type == "tool_result":
+                        content = block.get("content", "")
+                        if isinstance(content, list):
+                            content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+                        display = str(content)[:400] + "..." if len(str(content)) > 400 else str(content)
+                        task["events"].append({"type": "tool_result", "message": display or "(empty)", "ts": _ts()})
+
             elif etype == "result":
-                # Final result
-                result_text = evt.get("result", evt.get("text", ""))
+                result_text = evt.get("result", "")
                 if result_text:
                     final_text_parts.append(result_text)
                 task["events"].append({
-                    "type": "result",
-                    "message": result_text[:500] if result_text else "",
+                    "type": "status",
+                    "message": f"Done. Cost: ${evt.get('total_cost_usd', 0):.3f}, Turns: {evt.get('num_turns', '?')}",
                     "ts": _ts(),
                 })
+
+            elif etype == "user":
+                # Tool result comes back as type "user" with tool_result content
+                msg_obj = evt.get("message", {})
+                content_blocks = msg_obj.get("content", [])
+                for block in content_blocks:
+                    if block.get("type") == "tool_result":
+                        content = block.get("content", "")
+                        if isinstance(content, list):
+                            content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+                        display = str(content)[:400] + "..." if len(str(content)) > 400 else str(content)
+                        task["events"].append({"type": "tool_result", "message": display or "(empty)", "ts": _ts()})
+                # Also check tool_use_result at top level
+                tur = evt.get("tool_use_result", {})
+                if tur and not content_blocks:
+                    stdout = tur.get("stdout", "")
+                    stderr = tur.get("stderr", "")
+                    output = stdout or stderr
+                    display = output[:400] + "..." if len(output) > 400 else output
+                    if display:
+                        task["events"].append({"type": "tool_result", "message": display, "ts": _ts()})
+
+            elif etype == "system":
+                # Init event — show model info
+                model = evt.get("model", "")
+                if model:
+                    task["events"].append({"type": "status", "message": f"Using model: {model}", "ts": _ts()})
+
             elif etype == "error":
+                err = evt.get("error", {})
+                err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
                 task["events"].append({
                     "type": "error",
-                    "message": evt.get("error", evt.get("message", str(evt))),
+                    "message": err_msg[:500],
                     "ts": _ts(),
                 })
+
             else:
-                # Other events (system, etc) - show if they have useful content
                 msg = evt.get("message", evt.get("text", ""))
                 if msg:
-                    task["events"].append({"type": etype or "info", "message": str(msg)[:300], "ts": _ts()})
+                    task["events"].append({"type": "info", "message": str(msg)[:300], "ts": _ts()})
 
         await proc.wait()
+        await stderr_task
         task["final_output"] = "\n".join(final_text_parts) if final_text_parts else "(no output)"
         task["status"] = "done"
         task["events"].append({"type": "status", "message": "Investigation complete.", "ts": _ts()})
