@@ -253,7 +253,7 @@ document.addEventListener('alpine:init', () => {
 
         async diagnoseIssue(issue) {
             issue._fixing = true;
-            issue._fixProgress = ['Sending to Claude AI for diagnosis...'];
+            issue._fixProgress = ['Claude AI is investigating... (this may take a few minutes)'];
             issue._fixResult = null;
             issue._agentLog = [];
             issue._executing = false;
@@ -267,8 +267,7 @@ document.addEventListener('alpine:init', () => {
             if (data) {
                 issue._fixResult = data;
                 issue._fixProgress = [];
-                if (data.diagnosis) issue._fixProgress.push('Diagnosis: ' + data.diagnosis);
-                if (data.steps?.length) issue._fixProgress.push(data.steps.length + ' fix steps - review and approve');
+                if (data.duration_ms) issue._fixProgress.push('Completed in ' + (data.duration_ms / 1000).toFixed(1) + 's');
             } else {
                 issue._fixProgress.push('ERROR: Failed to get AI response');
             }
@@ -277,13 +276,13 @@ document.addEventListener('alpine:init', () => {
 
         async executePlan(issue, useAgent) {
             if (useAgent) {
-                if (!confirm('AI Agent will autonomously investigate and fix this issue using kubectl. Proceed?')) return;
+                if (!confirm('AI Agent will autonomously investigate and fix this issue. Proceed?')) return;
             } else {
-                if (!confirm('Execute all ' + (issue._fixResult?.steps?.length || 0) + ' steps? Review the plan above first.')) return;
+                if (!confirm('Execute all ' + (issue._fixResult?.steps?.length || 0) + ' steps?')) return;
             }
             issue._executing = true;
             issue._agentLog = [];
-            issue._fixProgress.push(useAgent ? 'Starting AI Agent...' : 'Executing approved plan...');
+            issue._fixProgress = [useAgent ? 'AI Agent investigating and fixing... (may take several minutes)' : 'Executing plan...'];
 
             const data = await this.api('/api/v1/issues/execute-plan', {
                 method: 'POST',
@@ -297,14 +296,17 @@ document.addEventListener('alpine:init', () => {
             });
 
             if (data) {
-                if (data.executed_steps) issue._fixResult.executed_steps = data.executed_steps;
+                if (data.executed_steps) {
+                    if (!issue._fixResult) issue._fixResult = {};
+                    issue._fixResult.executed_steps = data.executed_steps;
+                }
                 if (data.agent_log) issue._agentLog = data.agent_log;
-                if (data.final_output) issue._fixProgress.push('Agent result: ' + data.final_output.substring(0, 200));
-                if (data.duration_ms) issue._fixProgress.push('Execution: ' + (data.duration_ms / 1000).toFixed(1) + 's');
-                const ok = (data.executed_steps || []).filter(s => s.success).length;
-                const total = (data.executed_steps || []).length;
-                if (total > 0) issue._fixProgress.push(ok + '/' + total + ' steps succeeded');
-                issue._fixProgress.push(data.status === 'done' ? 'Execution complete' : 'Execution finished with issues');
+                if (data.final_output) {
+                    if (!issue._fixResult) issue._fixResult = {};
+                    issue._fixResult.diagnosis = data.final_output;
+                }
+                if (data.duration_ms) issue._fixProgress.push('Completed in ' + (data.duration_ms / 1000).toFixed(1) + 's');
+                issue._fixProgress.push(data.status === 'done' ? 'Complete' : 'Finished with issues');
             } else {
                 issue._fixProgress.push('ERROR: Execution failed');
             }
@@ -366,9 +368,9 @@ document.addEventListener('alpine:init', () => {
 
         async submitAiFix(autoExecute) {
             if (!this.aiFixError.trim()) return;
-            if (autoExecute && !confirm('Auto-execute will run safe commands on production. Continue?')) return;
+            if (autoExecute && !confirm('AI will investigate and apply safe fixes on production. Continue?')) return;
             this.aiFixLoading = true;
-            this.aiFixResult = null;
+            this.aiFixResult = { diagnosis: 'Claude AI is investigating... (this may take a few minutes)' };
             const data = await this.api('/api/v1/analysis/ai-fix', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },

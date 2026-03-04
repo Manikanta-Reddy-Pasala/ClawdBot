@@ -398,25 +398,42 @@ _PROD_CONTEXT = (
 
 @app.post("/api/v1/issues/fix-one", dependencies=[Depends(verify_api_key)])
 async def fix_one_issue(request: Request):
+    """Claude investigates the issue autonomously and reports findings."""
     data = await request.json()
     issue_text = data.get("issue", "")
     service = data.get("service", "")
     if not issue_text:
         raise HTTPException(400, "Missing issue text")
     prompt = (
-        f"{_PROD_CONTEXT}\n"
-        f"Diagnose this issue and provide fix steps.\n"
+        f"{_PROD_CONTEXT}\n\n"
         f"{'Service: ' + service + chr(10) if service else ''}"
         f"Issue: {issue_text}\n\n"
-        f"Return JSON: {{\"diagnosis\": \"...\", \"steps\": [{{\"description\": \"...\", \"command\": \"...\", \"risk\": \"low|medium|high\"}}]}}\n"
-        f"Use the kubectl prefix above. Investigate first (logs, describe, events), then suggest fixes."
+        f"INVESTIGATE this issue on the PRODUCTION cluster. Use kubectl to:\n"
+        f"1. Check pod status, events, and recent logs\n"
+        f"2. Identify the root cause\n"
+        f"3. Apply safe fixes (restart pods, clear sessions, etc.) - do NOT modify source code without approval\n"
+        f"4. Verify the fix worked\n\n"
+        f"Be thorough. Use as many tool calls as needed. Report what you found and what you did.\n"
+        f"If you fixed something, confirm it's working now.\n"
+        f"If the issue requires code changes, describe what needs to change but don't commit.\n\n"
+        f"After investigation, save a brief summary of the issue and fix to "
+        f"/opt/clawdbot/.claude/projects/-opt-clawdbot/memory/incident-learnings.md "
+        f"(append to file, create if not exists) so future investigations can reference past fixes."
     )
-    result = await _run_claude(prompt, timeout=60)
-    return _parse_ai_response(result)
+    start = time.time()
+    result = await _run_claude(prompt, timeout=600)
+    duration_ms = int((time.time() - start) * 1000)
+    return {
+        "status": "ok",
+        "diagnosis": result,
+        "steps": [],
+        "duration_ms": duration_ms,
+    }
 
 
 @app.post("/api/v1/issues/execute-plan", dependencies=[Depends(verify_api_key)])
 async def execute_plan(request: Request):
+    """AI Agent autonomously investigates and fixes."""
     data = await request.json()
     steps = data.get("steps", [])
     use_agent = data.get("use_agent", False)
@@ -425,20 +442,22 @@ async def execute_plan(request: Request):
 
     if use_agent:
         prompt = (
-            f"{_PROD_CONTEXT}\n"
-            f"Investigate and fix this issue autonomously on the PRODUCTION cluster.\n"
+            f"{_PROD_CONTEXT}\n\n"
             f"{'Service: ' + service + chr(10) if service else ''}"
             f"Issue: {issue_text}\n\n"
-            f"Use the kubectl prefix above. "
-            f"First investigate (logs, events, describe pod), then apply safe fixes. "
-            f"Report what you found and what you did."
+            f"AUTONOMOUSLY investigate and fix this issue on the PRODUCTION cluster.\n"
+            f"You have full access to kubectl, logs, MongoDB, source code repos at /opt/clawdbot/repos/.\n"
+            f"Do whatever is needed: restart pods, check logs, query MongoDB, read source code.\n"
+            f"If it's a code bug, read the source, make the fix, build and test.\n"
+            f"Do NOT commit/push code without explicit approval.\n\n"
+            f"After fixing, verify the fix worked and report everything you did.\n"
+            f"Save a brief summary to /opt/clawdbot/.claude/projects/-opt-clawdbot/memory/incident-learnings.md"
         )
         start = time.time()
-        result = await _run_claude(prompt, timeout=120)
-        agent_log = [{"type": "result", "text": result}]
+        result = await _run_claude(prompt, timeout=600)
         return {
             "status": "done",
-            "agent_log": agent_log,
+            "agent_log": [{"type": "result", "text": result}],
             "final_output": result,
             "duration_ms": int((time.time() - start) * 1000),
             "executed_steps": [],
@@ -488,6 +507,7 @@ async def analyze_and_fix(dry_run: bool = True):
 
 @app.post("/api/v1/analysis/ai-fix", dependencies=[Depends(verify_api_key)])
 async def ai_fix(request: Request):
+    """AI Error Diagnosis panel - Claude investigates and optionally auto-fixes."""
     data = await request.json()
     error_text = data.get("error_text", "")
     service = data.get("service", "")
@@ -495,39 +515,38 @@ async def ai_fix(request: Request):
     if not error_text:
         raise HTTPException(400, "Missing error_text")
 
-    prompt = (
-        f"{_PROD_CONTEXT}\n"
-        f"{'Service: ' + service + chr(10) if service else ''}"
-        f"Error/Question: {error_text}\n\n"
-        f"Diagnose the root cause and provide actionable fix steps.\n"
-        f"Return JSON: {{\"diagnosis\": \"...\", \"steps\": [{{\"description\": \"...\", \"command\": \"...\", \"risk\": \"low|medium|high\"}}]}}\n"
-        f"Use the kubectl prefix above. Investigate first, then suggest fixes."
-    )
+    if auto_execute:
+        prompt = (
+            f"{_PROD_CONTEXT}\n\n"
+            f"{'Service: ' + service + chr(10) if service else ''}"
+            f"Error/Problem: {error_text}\n\n"
+            f"INVESTIGATE AND FIX this issue autonomously on the PRODUCTION cluster.\n"
+            f"Use kubectl to check pods, logs, events, MongoDB queries — whatever is needed.\n"
+            f"Apply safe fixes directly (restart pods, clear sessions, scale up, etc.).\n"
+            f"If it's a code bug, identify it, describe the fix needed, but do NOT commit/push.\n"
+            f"Verify the fix worked after applying it.\n\n"
+            f"Save a brief summary to /opt/clawdbot/.claude/projects/-opt-clawdbot/memory/incident-learnings.md"
+        )
+    else:
+        prompt = (
+            f"{_PROD_CONTEXT}\n\n"
+            f"{'Service: ' + service + chr(10) if service else ''}"
+            f"Error/Problem: {error_text}\n\n"
+            f"DIAGNOSE this issue on the PRODUCTION cluster.\n"
+            f"Use kubectl to check pods, logs, events, MongoDB queries — whatever is needed.\n"
+            f"Find the root cause and explain what's happening and how to fix it.\n"
+            f"Be thorough in your investigation."
+        )
+
     start = time.time()
-    result = await _run_claude(prompt, timeout=180)
-    parsed = _parse_ai_response(result)
-    parsed["duration_ms"] = int((time.time() - start) * 1000)
-
-    if auto_execute and parsed.get("steps"):
-        executed = []
-        for step in parsed["steps"]:
-            cmd = step.get("command", "")
-            risk = step.get("risk", "medium")
-            if risk == "high":
-                executed.append({"command": cmd, "success": False, "output": "Skipped: high-risk, needs approval"})
-                continue
-            if not cmd:
-                continue
-            safe, reason = is_command_safe(cmd)
-            if not safe:
-                executed.append({"command": cmd, "success": False, "output": f"Blocked: {reason}"})
-                continue
-            output = await execute_shell(cmd, timeout=30)
-            success = "[exit code: 0]" in output
-            executed.append({"command": cmd, "success": success, "output": output})
-        parsed["executed_steps"] = executed
-
-    return parsed
+    result = await _run_claude(prompt, timeout=600)
+    duration_ms = int((time.time() - start) * 1000)
+    return {
+        "status": "ok",
+        "diagnosis": result,
+        "steps": [],
+        "duration_ms": duration_ms,
+    }
 
 
 async def _run_claude(prompt: str, timeout: int = 90) -> str:
@@ -564,24 +583,6 @@ async def _run_claude(prompt: str, timeout: int = 90) -> str:
     except Exception as e:
         return f"(Error running Claude: {e})"
 
-
-def _parse_ai_response(text: str) -> dict:
-    """Try to parse JSON from Claude response, fallback to text diagnosis."""
-    # Try to extract JSON block
-    import re
-    json_match = re.search(r'\{[\s\S]*"diagnosis"[\s\S]*\}', text)
-    if json_match:
-        try:
-            parsed = json.loads(json_match.group())
-            return {
-                "status": "ok",
-                "diagnosis": parsed.get("diagnosis", ""),
-                "steps": parsed.get("steps", []),
-                "raw": text,
-            }
-        except json.JSONDecodeError:
-            pass
-    return {"status": "ok", "diagnosis": text, "steps": [], "raw": text}
 
 
 @app.post("/api/v1/logs/{service}/analyze", dependencies=[Depends(verify_api_key)])
