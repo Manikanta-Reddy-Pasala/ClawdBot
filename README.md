@@ -1,29 +1,38 @@
 # ClawdBot
 
-A Telegram bot that wraps [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (Max subscription OAuth) into a personal AI assistant. Send a message in Telegram and Claude reads files, edits code, runs shell commands, queries databases, and manages Kubernetes clusters on your behalf.
+A Telegram bot that wraps [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (Max subscription OAuth) into a personal AI assistant with an integrated DevOps monitoring dashboard. Send a message in Telegram and Claude reads files, edits code, runs shell commands, queries databases, and manages Kubernetes clusters on your behalf.
 
-## How It Works
+## Architecture
 
 ```
-Telegram message (text, photo, or document)
-      │
-      ▼
-   bot.py ──► task_queue (SQLite) ──► executor
-                                        │
-                                   Agent SDK (default)
-                                   claude-agent-sdk
-                                        │
-                                   Orchestrator Claude
-                                   delegates to sub-agents:
-                                     planner → architect
-                                     → coder → tester
-                                     → reviewer
-                                        │
-                                   Raw CLI fallback
-                                   (if SDK unavailable)
-                                        │
-                                        ▼
-                               Result sent to Telegram
+                    ┌─────────────────────┐
+                    │   Telegram Bot      │ ← User sends messages, gets alerts
+                    │   (bot.py)          │ → Approval callbacks for remediation
+                    └────────┬────────────┘
+                             │
+        ┌────────────────────┴────────────────────┐
+        │           ClawdBot Process              │
+        │  (bot.py + FastAPI + APScheduler)        │
+        ├─────────────────────────────────────────┤
+        │ Executor (Claude Agent SDK)             │
+        │ Task Queue (SQLite)                     │
+        │ Progress Broadcaster (SSE + WebSocket)  │
+        ├─────────────────────────────────────────┤
+        │ devops/ module:                         │
+        │  ├─ monitors (K8s, MongoDB, NATS, Logs) │
+        │  ├─ patterns (51 error patterns)        │
+        │  ├─ playbooks (10 remediations)         │
+        │  ├─ incident manager                    │
+        │  ├─ approval workflow                   │
+        │  └─ k8s/mongodb/nats clients (kubectl)  │
+        └────────┬────────────────────────────────┘
+                 │ FastAPI :8000
+                 │ SSE + WebSocket
+        ┌────────┴────────────────────┐
+        │  DevOps Web Dashboard       │
+        │  (Alpine.js + D3.js)        │
+        │  Served as static files     │
+        └─────────────────────────────┘
 ```
 
 ### Message Flow
@@ -35,9 +44,9 @@ Telegram message (text, photo, or document)
 5. **Live status** — tool calls and agent delegations are streamed as Telegram status updates with elapsed time. A heartbeat updates the status every 10 seconds even during long-running operations
 6. **Result** — final response is sent back to Telegram, status message is deleted, session ID is saved for `--resume`
 
-### Execution
+### Sub-Agents
 
-All messages go through the Agent SDK path by default. The orchestrator Claude sees 5 sub-agent definitions and delegates via the `Task` tool:
+All messages go through the Agent SDK path by default. The orchestrator Claude delegates via the `Task` tool:
 
 | Agent | Tools | Purpose |
 |-------|-------|---------|
@@ -49,26 +58,46 @@ All messages go through the Agent SDK path by default. The orchestrator Claude s
 
 **Fallback**: If the SDK isn't installed or crashes mid-run, the executor automatically falls back to raw `claude -p` subprocess with `--resume` for session continuity.
 
-### Status Updates
+## DevOps Dashboard
 
-While a task runs, the Telegram status message shows:
-- **Elapsed time** — `[#42] 2m 35s`
-- **Agent pipeline** — `planner > coder > tester`
-- **Current activity** — last tool call or agent delegation
-- **Heartbeat** — updates every 10 seconds even during long operations (e.g., docker builds, SSH commands)
+Web-based monitoring dashboard at `http://<server>:8000/` with 15 tabs:
 
-### Attachments
+| Tab | Description |
+|-----|-------------|
+| Overview | Health score, service status, pod counts, infrastructure cards |
+| Services | All 19 microservices with health status and response times |
+| Topology | D3.js service dependency graph |
+| Kubernetes | Pod listing across namespaces, warning events |
+| Nodes | Cluster node CPU/memory usage, per-pod resource metrics |
+| MongoDB | Connection pool, sessions, sync errors, version info |
+| NATS | JetStream streams, consumers, DLQ messages |
+| Redpanda | Broker health, Debezium CDC status, monitored collections, Kafka topics |
+| Dragonfly | Redis-compatible cache status, memory, hit rate |
+| Certs | TLS certificate status and expiry |
+| OpenObserve | Observability platform integration (stub) |
+| Log Analysis | AI-powered log scanning against 51 error patterns |
+| Issues | Automated issue detection across all systems |
+| Incidents | Incident lifecycle management |
+| Remediation | 10 playbooks with dry-run and execute capabilities |
 
-Photos and documents sent in Telegram are downloaded to the server and their file paths are included in the prompt so Claude can read/analyze them directly.
+### Background Monitors
 
-### Contexts
+APScheduler runs 6 monitors alongside the Telegram bot:
 
-Contexts map to working directories. Each context has its own:
-- Task queue (one task runs at a time per context)
-- Session ID (conversation continuity via `--resume`)
-- Conversation history
+| Monitor | Interval | What it checks |
+|---------|----------|----------------|
+| KubernetesMonitor | 60s | Pods, deployments, events across all namespaces |
+| ServiceHealthMonitor | 60s | HTTP health checks for all services via kubectl exec |
+| MongoDBMonitor | 120s | Connections, sessions, sync errors, server status |
+| NATSMonitor | 60s | Streams, consumers, DLQ messages |
+| LogAnalyzerMonitor | 300s | Scans pod logs against 51 error patterns |
+| IssueFinder | 300s | Aggregates issues, detects problems |
 
-Built-in context: `vm` (default, `/opt/clawdbot`). Repos in `/opt/clawdbot/repos/` are auto-discovered as contexts. Custom contexts can be created with `/newctx`.
+### Remediation & Approval
+
+- **LOW risk** actions: auto-execute (check connections, fetch logs)
+- **MEDIUM risk**: auto-execute unless `requires_approval=True`
+- **HIGH risk**: always request approval via Telegram inline keyboard or web UI
 
 ## Commands
 
@@ -97,6 +126,7 @@ Built-in context: `vm` (default, `/opt/clawdbot`). Repos in `/opt/clawdbot/repos
 - Python 3.11+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (Max subscription)
 - Telegram bot token from [@BotFather](https://t.me/BotFather)
+- kubectl access to Kubernetes cluster (for DevOps monitoring)
 
 ### Install
 
@@ -112,12 +142,8 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.template .env
-# Edit .env with your values:
-#   TELEGRAM_BOT_TOKEN=...
-#   ALLOWED_USER_IDS=your_telegram_id
+# Edit .env with your values
 ```
-
-Key environment variables:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -126,6 +152,10 @@ Key environment variables:
 | `DB_PATH` | No | `/opt/clawdbot/conversations.db` | SQLite database path |
 | `REPOS_DIR` | No | `/opt/clawdbot/repos` | Auto-discovered repo contexts |
 | `SHELL_TIMEOUT` | No | `60` | Shell command timeout (seconds) |
+| `DEVOPS_ENABLED` | No | `true` | Enable DevOps monitoring and dashboard |
+| `API_PORT` | No | `8000` | Dashboard/API port |
+| `DEVOPS_API_KEY` | No | (none) | API key for dashboard endpoints |
+| `ALERT_CHAT_ID` | No | `0` | Telegram chat ID for DevOps alerts |
 
 ### Run
 
@@ -133,35 +163,62 @@ Key environment variables:
 python bot.py
 ```
 
-### Deploy (systemd)
+### Deploy
 
 ```bash
-# Copy to server and set up as a service
 ./deploy.sh
 ```
 
-The deploy script SSHs into the server, copies files, installs dependencies in a venv, and configures a systemd service that auto-restarts on failure.
+The deploy script SSHs into the server (`77.42.68.16`), copies all files via scp, installs dependencies in a venv, and configures a systemd service that auto-restarts on failure. No CI/CD pipelines — purely manual deployment.
 
 ## File Structure
 
 ```
 ClawdBot/
-├── bot.py              # Telegram handlers, command routing, attachment downloads
-├── executor.py         # Task execution — Agent SDK + CLI fallback, heartbeat status
-├── agents.py           # Sub-agent definitions (planner, architect, coder, tester, reviewer)
-├── task_queue.py       # SQLite-backed task queue with status tracking
-├── context_manager.py  # Working directories, session IDs, conversation history
-├── config.py           # Environment variable loading
-├── tools.py            # Tool call description formatting for status updates
-├── shell_executor.py   # Direct shell command execution with safety checks
-├── requirements.txt    # Python dependencies
-├── deploy.sh           # SSH deploy script
-├── clawdbot.service    # systemd unit file
-├── .env.template       # Environment variable template
-└── CLAUDE.md           # System prompt for Claude (injected via CLI)
+├── bot.py                  # Telegram handlers, approval callbacks, API server startup
+├── executor.py             # Task execution — Agent SDK + CLI fallback, progress broadcasting
+├── api_server.py           # FastAPI server (69 endpoints), serves dashboard
+├── progress_broadcaster.py # SSE + WebSocket broadcast for real-time updates
+├── agents.py               # Sub-agent definitions (planner, architect, coder, tester, reviewer)
+├── task_queue.py           # SQLite-backed task queue with status tracking
+├── context_manager.py      # Working directories, session IDs, conversation history
+├── config.py               # Environment variable loading
+├── tools.py                # Tool call description formatting for status updates
+├── shell_executor.py       # Direct shell command execution with safety checks
+├── devops/
+│   ├── models.py           # Pydantic models (ServiceHealth, Incident, etc.)
+│   ├── monitors.py         # 6 background monitors (K8s, MongoDB, NATS, etc.)
+│   ├── scheduler.py        # APScheduler setup
+│   ├── k8s_client.py       # kubectl subprocess client
+│   ├── mongodb_client.py   # mongosh via kubectl exec
+│   ├── nats_client.py      # NATS monitoring via kubectl exec
+│   ├── patterns.py         # 51 error patterns for log analysis
+│   ├── topology.py         # Service dependency graph (19 services)
+│   ├── correlator.py       # Error correlation engine
+│   ├── playbooks.py        # 10 remediation playbooks
+│   ├── remediation.py      # Playbook execution engine
+│   ├── incident_manager.py # Incident lifecycle management
+│   ├── approval.py         # Approval workflow (Telegram + web)
+│   ├── auto_remediation.py # Incident → playbook matching + cooldown
+│   ├── notifications.py    # Telegram alert notifications
+│   └── event_bus.py        # Async pub/sub event system
+├── static/
+│   ├── index.html          # Dashboard UI (Alpine.js)
+│   ├── css/dashboard.css   # Dashboard styles
+│   └── js/
+│       ├── app.js          # Dashboard logic, API calls, tab management
+│       ├── charts.js       # Chart.js doughnut chart
+│       ├── topology.js     # D3.js service topology graph
+│       └── websocket.js    # WebSocket client for real-time updates
+├── requirements.txt
+├── deploy.sh               # Manual scp deployment script
+├── sync-context.sh         # Sync CLAUDE.md + memory to server
+├── clawdbot.service        # systemd unit file
+├── .env.template
+└── CLAUDE.md               # System prompt for Claude
 ```
 
-## How Session Continuity Works
+## Session Continuity
 
 Each (chat_id, context) pair stores a Claude CLI session ID in SQLite. When the user sends a follow-up message, the executor passes `--resume <session_id>` to the CLI, giving Claude full conversation history without re-sending it. The `/clear` command deletes the session, starting fresh.
 
@@ -171,3 +228,4 @@ Each (chat_id, context) pair stores a Claude CLI session ID in SQLite. When the 
 - **Shell blocklist**: Destructive commands (`rm -rf /`, `mkfs`, `dd`, `shutdown`, etc.) are blocked
 - **No API key exposure**: `ANTHROPIC_API_KEY` is stripped from the subprocess environment so Claude CLI uses Max subscription OAuth instead
 - **Permission bypass**: Uses `bypassPermissions` since the bot runs unattended — the CLAUDE.md system prompt constrains behavior (never auto-commit, confirm before destructive ops)
+- **Remediation approval**: High-risk DevOps actions require explicit approval via Telegram inline keyboard
