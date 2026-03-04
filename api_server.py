@@ -1,0 +1,769 @@
+"""FastAPI API server for ClawdBot DevOps dashboard."""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.responses import FileResponse
+
+import progress_broadcaster as broadcaster
+from devops.monitors import (
+    kubernetes_monitor, service_health_monitor, mongodb_monitor,
+    nats_monitor, log_analyzer_monitor, issue_finder,
+)
+from devops.incident_manager import incident_manager
+from devops.topology import build_topology, SERVICE_TOPOLOGY
+from devops.playbooks import get_all_playbooks, get_playbook
+from devops.remediation import execute_playbook, get_execution_history
+from devops.approval import (
+    get_pending as get_pending_approvals,
+    approve as approve_request,
+    reject as reject_request,
+    get_all as get_all_approvals,
+)
+from devops.models import Severity
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="ClawdBot DevOps API", version="1.0.0")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --- API Key Auth ---
+
+API_KEY = os.environ.get("DEVOPS_API_KEY", "")
+
+
+async def verify_api_key(request: Request):
+    if not API_KEY:
+        return  # No key configured = open access
+    key = request.headers.get("X-API-Key", "") or request.query_params.get("api_key", "")
+    if key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+# --- Health ---
+
+@app.get("/api/v1/health")
+async def health():
+    return {"status": "ok", "service": "clawdbot-devops", "timestamp": datetime.utcnow().isoformat()}
+
+
+# --- Dashboard ---
+
+@app.get("/api/v1/dashboard/overview", dependencies=[Depends(verify_api_key)])
+async def dashboard_overview():
+    k8s = kubernetes_monitor.cluster_overview
+    mongo = mongodb_monitor.health
+    nats = nats_monitor.health
+
+    services = service_health_monitor.services
+    healthy = sum(1 for s in services.values() if s.status.value == "healthy")
+    degraded = sum(1 for s in services.values() if s.status.value == "degraded")
+    critical = sum(1 for s in services.values() if s.status.value == "critical")
+
+    issues = issue_finder.current_issues
+    active_incidents = incident_manager.get_active()
+
+    # Calculate health score
+    total_services = len(SERVICE_TOPOLOGY)
+    score = round((healthy / total_services * 100) if total_services > 0 else 0)
+    warnings = []
+    critical_issues = []
+    if k8s.failed_pods > 0:
+        critical_issues.append(f"{k8s.failed_pods} failed pods")
+    if critical > 0:
+        critical_issues.append(f"{critical} services down")
+    if degraded > 0:
+        warnings.append(f"{degraded} services degraded")
+    if k8s.warning_events > 5:
+        warnings.append(f"{k8s.warning_events} K8s warning events")
+
+    status = "healthy"
+    if critical > 0 or k8s.failed_pods > 0:
+        status = "critical"
+        score = min(score, 50)
+    elif degraded > 0:
+        status = "degraded"
+        score = min(score, 80)
+
+    # Flat format expected by the dashboard HTML
+    return {
+        "health_score": {
+            "overall": score,
+            "status": status,
+            "warnings": warnings,
+            "critical_issues": critical_issues,
+        },
+        "services_healthy": healthy,
+        "services_degraded": degraded,
+        "services_critical": critical,
+        "pods_running": k8s.running_pods,
+        "pods_total": k8s.total_pods,
+        "active_incidents": len(active_incidents),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+# --- Kubernetes ---
+
+@app.get("/api/v1/kubernetes/pods", dependencies=[Depends(verify_api_key)])
+async def get_pods(namespace: str = "default"):
+    from devops import k8s_client
+    return await k8s_client.list_pods(namespace)
+
+
+@app.get("/api/v1/kubernetes/deployments", dependencies=[Depends(verify_api_key)])
+async def get_deployments(namespace: str = "default"):
+    from devops import k8s_client
+    return await k8s_client.list_deployments(namespace)
+
+
+@app.get("/api/v1/kubernetes/events", dependencies=[Depends(verify_api_key)])
+async def get_events(namespace: str = "default"):
+    from devops import k8s_client
+    return await k8s_client.get_events(namespace)
+
+
+@app.get("/api/v1/kubernetes/nodes", dependencies=[Depends(verify_api_key)])
+async def get_nodes():
+    from devops import k8s_client
+    return await k8s_client.get_nodes()
+
+
+@app.get("/api/v1/kubernetes/logs/{service}", dependencies=[Depends(verify_api_key)])
+async def get_service_logs(service: str, namespace: str = "default", tail: int = 200):
+    from devops import k8s_client
+    logs = await k8s_client.get_deployment_logs(service, namespace, tail)
+    return {"service": service, "namespace": namespace, "logs": logs}
+
+
+# --- Services ---
+
+@app.get("/api/v1/services", dependencies=[Depends(verify_api_key)])
+async def list_services():
+    services = []
+    for name, info in SERVICE_TOPOLOGY.items():
+        health = service_health_monitor.services.get(name)
+        services.append({
+            "name": name,
+            "namespace": info.namespace,
+            "port": info.port,
+            "tier": info.tier.value,
+            "health_path": info.health_path,
+            "status": health.status.value if health else "unknown",
+            "response_time_ms": health.response_time_ms if health else None,
+            "error": health.error if health else None,
+        })
+    return services
+
+
+@app.get("/api/v1/services/topology", dependencies=[Depends(verify_api_key)])
+async def get_topology():
+    topo = build_topology()
+    return topo.model_dump()
+
+
+# --- MongoDB ---
+
+@app.get("/api/v1/mongodb/health", dependencies=[Depends(verify_api_key)])
+async def mongo_health():
+    return mongodb_monitor.health.model_dump()
+
+
+@app.get("/api/v1/mongodb/connections", dependencies=[Depends(verify_api_key)])
+async def mongo_connections():
+    from devops import mongodb_client
+    return await mongodb_client.get_connection_pool()
+
+
+@app.get("/api/v1/mongodb/sync-errors", dependencies=[Depends(verify_api_key)])
+async def mongo_sync_errors(limit: int = 20):
+    from devops import mongodb_client
+    return await mongodb_client.get_sync_errors(limit)
+
+
+# --- NATS ---
+
+@app.get("/api/v1/nats/health", dependencies=[Depends(verify_api_key)])
+async def nats_health():
+    return nats_monitor.health.model_dump()
+
+
+@app.get("/api/v1/nats/streams", dependencies=[Depends(verify_api_key)])
+async def nats_streams():
+    from devops import nats_client
+    return await nats_client.get_all_streams()
+
+
+@app.get("/api/v1/nats/consumers", dependencies=[Depends(verify_api_key)])
+async def nats_consumers():
+    from devops import nats_client
+    return await nats_client.get_all_consumers()
+
+
+# --- Logs ---
+
+@app.get("/api/v1/logs/{service}", dependencies=[Depends(verify_api_key)])
+async def analyze_service_logs(service: str, namespace: str = "default", tail: int = 200):
+    result = await log_analyzer_monitor.analyze_service(service, namespace, tail)
+    return result.model_dump()
+
+
+# --- Issues ---
+
+@app.get("/api/v1/issues", dependencies=[Depends(verify_api_key)])
+async def list_issues():
+    return issue_finder.last_scan_result or {"issues": [], "total_issues": 0}
+
+
+@app.post("/api/v1/issues/scan", dependencies=[Depends(verify_api_key)])
+async def scan_issues():
+    await issue_finder.safe_check()
+    return issue_finder.last_scan_result or {"issues": [], "total_issues": 0}
+
+
+@app.post("/api/v1/issues/autodetect", dependencies=[Depends(verify_api_key)])
+async def autodetect_issues():
+    await issue_finder.safe_check()
+    return issue_finder.last_scan_result or {"issues": [], "total_issues": 0}
+
+
+@app.post("/api/v1/issues/fix-one", dependencies=[Depends(verify_api_key)])
+async def fix_one_issue(request: Request):
+    return {"status": "not_implemented", "message": "Use remediation playbooks instead"}
+
+
+@app.post("/api/v1/issues/execute-plan", dependencies=[Depends(verify_api_key)])
+async def execute_plan(request: Request):
+    return {"status": "not_implemented", "message": "Use remediation playbooks instead"}
+
+
+@app.post("/api/v1/issues/run-step", dependencies=[Depends(verify_api_key)])
+async def run_step(request: Request):
+    return {"status": "not_implemented", "message": "Use remediation playbooks instead"}
+
+
+@app.post("/api/v1/issues/deploy", dependencies=[Depends(verify_api_key)])
+async def deploy_issue(service: str = "", namespace: str = "default"):
+    return {"status": "not_implemented", "message": "Deploy via Telegram /task command"}
+
+
+@app.post("/api/v1/issues/analyze-and-fix", dependencies=[Depends(verify_api_key)])
+async def analyze_and_fix(dry_run: bool = True):
+    await issue_finder.safe_check()
+    return issue_finder.last_scan_result or {"issues": [], "total_issues": 0}
+
+
+@app.post("/api/v1/analysis/ai-fix", dependencies=[Depends(verify_api_key)])
+async def ai_fix(request: Request):
+    return {"status": "not_implemented", "message": "Use ClawdBot Telegram for AI analysis"}
+
+
+@app.post("/api/v1/logs/{service}/analyze", dependencies=[Depends(verify_api_key)])
+async def analyze_logs_post(service: str, request: Request):
+    namespace = "pos" if service.lower().startswith("pos") else "default"
+    result = await log_analyzer_monitor.analyze_service(service, namespace, 200)
+    return result.model_dump()
+
+
+@app.post("/api/v1/incidents/{incident_id}/postmortem", dependencies=[Depends(verify_api_key)])
+async def incident_postmortem(incident_id: str):
+    incident = incident_manager.get(incident_id)
+    if not incident:
+        raise HTTPException(404, "Incident not found")
+    return {"incident_id": incident_id, "postmortem": "Use ClawdBot Telegram for AI postmortem analysis"}
+
+
+# --- OpenObserve (stub) ---
+
+@app.get("/api/v1/openobserve/status", dependencies=[Depends(verify_api_key)])
+async def openobserve_status():
+    return {"status": "not_configured", "message": "OpenObserve not connected"}
+
+
+@app.get("/api/v1/openobserve/errors/{service}", dependencies=[Depends(verify_api_key)])
+async def openobserve_errors(service: str, minutes: int = 60):
+    return {"errors": [], "service": service}
+
+
+@app.get("/api/v1/openobserve/traces/slow", dependencies=[Depends(verify_api_key)])
+async def openobserve_slow_traces(minutes: int = 60):
+    return {"traces": []}
+
+
+# --- Incidents ---
+
+@app.get("/api/v1/incidents", dependencies=[Depends(verify_api_key)])
+async def list_incidents(status: str | None = None):
+    if status == "active":
+        incidents = incident_manager.get_active()
+    else:
+        incidents = incident_manager.get_all()
+    return [i.model_dump() for i in incidents]
+
+
+@app.post("/api/v1/incidents", dependencies=[Depends(verify_api_key)])
+async def create_incident(request: Request):
+    data = await request.json()
+    incident = incident_manager.create(
+        title=data["title"],
+        severity=Severity(data.get("severity", "warning")),
+        affected_services=data.get("affected_services", []),
+        description=data.get("description", ""),
+    )
+    return incident.model_dump()
+
+
+@app.get("/api/v1/incidents/{incident_id}", dependencies=[Depends(verify_api_key)])
+async def get_incident(incident_id: str):
+    incident = incident_manager.get(incident_id)
+    if not incident:
+        raise HTTPException(404, "Incident not found")
+    return incident.model_dump()
+
+
+@app.post("/api/v1/incidents/{incident_id}/resolve", dependencies=[Depends(verify_api_key)])
+async def resolve_incident(incident_id: str, request: Request):
+    data = await request.json()
+    incident = incident_manager.resolve(incident_id, data.get("message", ""))
+    if not incident:
+        raise HTTPException(404, "Incident not found")
+    return incident.model_dump()
+
+
+# --- Remediation ---
+
+@app.get("/api/v1/remediation/playbooks", dependencies=[Depends(verify_api_key)])
+async def list_playbooks():
+    return [p.model_dump() for p in get_all_playbooks()]
+
+
+@app.get("/api/v1/remediation/playbooks/{name}", dependencies=[Depends(verify_api_key)])
+async def get_playbook_detail(name: str):
+    pb = get_playbook(name)
+    if not pb:
+        raise HTTPException(404, "Playbook not found")
+    return pb.model_dump()
+
+
+@app.post("/api/v1/remediation/execute", dependencies=[Depends(verify_api_key)])
+async def execute_playbook_api(request: Request):
+    data = await request.json()
+    result = await execute_playbook(
+        data["playbook"],
+        context=data.get("context", {}),
+        dry_run=data.get("dry_run", True),
+    )
+    return result
+
+
+@app.get("/api/v1/remediation/history", dependencies=[Depends(verify_api_key)])
+async def remediation_history():
+    return get_execution_history()
+
+
+@app.get("/api/v1/remediation/approvals", dependencies=[Depends(verify_api_key)])
+async def list_approvals():
+    return get_pending_approvals()
+
+
+@app.post("/api/v1/remediation/approvals/{approval_id}/approve", dependencies=[Depends(verify_api_key)])
+async def approve_action(approval_id: str):
+    result = approve_request(approval_id)
+    if not result:
+        raise HTTPException(404, "Approval not found or already decided")
+    return result
+
+
+@app.post("/api/v1/remediation/approvals/{approval_id}/reject", dependencies=[Depends(verify_api_key)])
+async def reject_action(approval_id: str):
+    result = reject_request(approval_id)
+    if not result:
+        raise HTTPException(404, "Approval not found or already decided")
+    return result
+
+
+# --- K8s routes (aliases for dashboard compatibility) ---
+
+@app.get("/api/v1/k8s/pods", dependencies=[Depends(verify_api_key)])
+async def k8s_pods(namespace: str = "default"):
+    from devops import k8s_client
+    return await k8s_client.list_pods(namespace)
+
+
+@app.get("/api/v1/k8s/events", dependencies=[Depends(verify_api_key)])
+async def k8s_events(namespace: str = "default"):
+    from devops import k8s_client
+    return await k8s_client.get_events(namespace)
+
+
+# --- Nodes ---
+
+@app.get("/api/v1/nodes/metrics", dependencies=[Depends(verify_api_key)])
+async def node_metrics():
+    from devops import k8s_client
+    return await k8s_client.get_nodes()
+
+
+@app.get("/api/v1/nodes/pods", dependencies=[Depends(verify_api_key)])
+async def node_pods(namespace: str = "default"):
+    from devops import k8s_client
+    raw = await k8s_client.get_top_pods(namespace)
+    result = []
+    for p in raw:
+        cpu_str = p.get("cpu", "0m")
+        mem_str = p.get("memory", "0Mi")
+        cpu_m = int(cpu_str.rstrip("m")) if cpu_str.endswith("m") else 0
+        mem_m = int(mem_str.rstrip("Mi")) if mem_str.endswith("Mi") else 0
+        result.append({"name": p["name"], "cpu_millicores": cpu_m, "memory_mib": mem_m})
+    result.sort(key=lambda x: x["cpu_millicores"], reverse=True)
+    return result
+
+
+# --- Dragonfly ---
+
+@app.get("/api/v1/dragonfly/health", dependencies=[Depends(verify_api_key)])
+async def dragonfly_health():
+    from devops import k8s_client
+    pods = await k8s_client.list_pods("default")
+    df_pods = [p for p in pods if p["name"].startswith("dragonfly") and p["status"] == "Running"]
+    if not df_pods:
+        return {"status": "critical", "error": "No Dragonfly pods", "memory_used": "?", "hit_rate": 0, "connected_clients": 0, "memory_percent": 0}
+    mem_raw = await k8s_client.exec_in_pod(df_pods[0]["name"], "default", ["redis-cli", "info", "memory"])
+    stats_raw = await k8s_client.exec_in_pod(df_pods[0]["name"], "default", ["redis-cli", "info", "stats"])
+    clients_raw = await k8s_client.exec_in_pod(df_pods[0]["name"], "default", ["redis-cli", "info", "clients"])
+
+    def parse_info(raw):
+        d = {}
+        for line in (raw or "").splitlines():
+            if ":" in line and not line.startswith("#"):
+                k, v = line.split(":", 1)
+                d[k.strip()] = v.strip()
+        return d
+
+    mem = parse_info(mem_raw)
+    stats = parse_info(stats_raw)
+    clients = parse_info(clients_raw)
+
+    used = mem.get("used_memory_human", "?")
+    maxmem = int(mem.get("maxmemory", "1") or "1")
+    used_bytes = int(mem.get("used_memory", "0") or "0")
+    mem_pct = round(used_bytes / maxmem * 100, 1) if maxmem > 0 else 0
+
+    hits = int(stats.get("keyspace_hits", "0") or "0")
+    misses = int(stats.get("keyspace_misses", "0") or "0")
+    hit_rate = round(hits / (hits + misses) * 100, 1) if (hits + misses) > 0 else 0
+
+    return {
+        "status": "healthy",
+        "memory_used": used,
+        "memory_percent": mem_pct,
+        "hit_rate": hit_rate,
+        "connected_clients": int(clients.get("connected_clients", "0") or "0"),
+    }
+
+
+@app.get("/api/v1/dragonfly/blocks", dependencies=[Depends(verify_api_key)])
+async def dragonfly_blocks():
+    from devops import k8s_client
+    pods = await k8s_client.list_pods("default")
+    df_pods = [p for p in pods if p["name"].startswith("dragonfly") and p["status"] == "Running"]
+    if not df_pods:
+        return []
+    raw = await k8s_client.exec_in_pod(df_pods[0]["name"], "default", ["redis-cli", "keys", "ratelimit:block:*"])
+    return [k.strip() for k in raw.splitlines() if k.strip()] if raw else []
+
+
+@app.get("/api/v1/dragonfly/locks", dependencies=[Depends(verify_api_key)])
+async def dragonfly_locks():
+    from devops import k8s_client
+    pods = await k8s_client.list_pods("default")
+    df_pods = [p for p in pods if p["name"].startswith("dragonfly") and p["status"] == "Running"]
+    if not df_pods:
+        return []
+    raw = await k8s_client.exec_in_pod(df_pods[0]["name"], "default", ["redis-cli", "keys", "lock:posserverbackend:*"])
+    return [k.strip() for k in raw.splitlines() if k.strip()] if raw else []
+
+
+@app.post("/api/v1/dragonfly/blocks/{business_id}/unblock", dependencies=[Depends(verify_api_key)])
+async def unblock_business(business_id: str):
+    from devops import k8s_client
+    pods = await k8s_client.list_pods("default")
+    df_pods = [p for p in pods if p["name"].startswith("dragonfly") and p["status"] == "Running"]
+    if not df_pods:
+        return {"error": "No Dragonfly pods"}
+    result = await k8s_client.exec_in_pod(df_pods[0]["name"], "default", ["redis-cli", "del", f"ratelimit:block:{business_id}"])
+    return {"result": result}
+
+
+# --- Redpanda ---
+
+@app.get("/api/v1/redpanda/health", dependencies=[Depends(verify_api_key)])
+async def redpanda_health():
+    from devops import k8s_client
+    raw, brokers_raw, topics_raw = await asyncio.gather(
+        k8s_client.exec_in_pod("redpanda-0", "kafka", ["curl", "-s", "http://localhost:9644/v1/status/ready"], timeout=10),
+        k8s_client.exec_in_pod("redpanda-0", "kafka", ["curl", "-s", "http://localhost:9644/v1/brokers"], timeout=10),
+        k8s_client.exec_in_pod("redpanda-0", "kafka", ["rpk", "topic", "list", "--format", "json"], timeout=10),
+    )
+    import json as j
+    brokers = []
+    try:
+        brokers = j.loads(brokers_raw) if brokers_raw else []
+    except Exception:
+        pass
+    partition_count = 0
+    topic_count = 0
+    try:
+        topics = j.loads(topics_raw) if topics_raw else []
+        if isinstance(topics, list):
+            topic_count = len(topics)
+            for t in topics:
+                partition_count += t.get("partitions", t.get("partition_count", 0))
+    except Exception:
+        pass
+    return {
+        "ready": bool(raw),
+        "status": "healthy" if raw else "critical",
+        "brokers": brokers,
+        "partition_count": partition_count,
+        "topic_count": topic_count,
+    }
+
+
+async def _find_debezium_pod():
+    from devops import k8s_client
+    pods = await k8s_client.list_pods("kafka")
+    for p in pods:
+        if p["name"].startswith("debezium-connect") and p["status"] == "Running":
+            return p["name"]
+    return None
+
+
+@app.get("/api/v1/redpanda/debezium", dependencies=[Depends(verify_api_key)])
+async def debezium_status():
+    from devops import k8s_client
+    pod = await _find_debezium_pod()
+    if not pod:
+        return {"connectors": [], "error": "No debezium pod found"}
+    raw = await k8s_client.exec_in_pod(pod, "kafka", ["curl", "-s", "http://localhost:8083/connectors?expand=status"], timeout=10)
+    import json as j
+    try:
+        data = j.loads(raw) if raw else {}
+        connectors = []
+        for name, info in data.items():
+            status = info.get("status", {})
+            connector_state = status.get("connector", {}).get("state", "UNKNOWN")
+            tasks = status.get("tasks", [])
+            running_tasks = sum(1 for t in tasks if t.get("state") == "RUNNING")
+            failed_tasks = sum(1 for t in tasks if t.get("state") == "FAILED")
+            connectors.append({
+                "name": name,
+                "state": connector_state,
+                "tasks": len(tasks),
+                "running_tasks": running_tasks,
+                "failed_tasks": failed_tasks,
+                "task_states": tasks,
+            })
+        return {"connectors": connectors}
+    except Exception:
+        return {"connectors": [], "raw": raw}
+
+
+@app.get("/api/v1/redpanda/debezium/detail", dependencies=[Depends(verify_api_key)])
+async def debezium_detail():
+    from devops import k8s_client
+    import json as j
+    pod = await _find_debezium_pod()
+    if not pod:
+        return {"error": "No debezium pod found"}
+    connector_name = "oneshell-mongodb-connector"
+    # Fetch status, config, and topics in parallel
+    status_raw, config_raw, topics_raw = await asyncio.gather(
+        k8s_client.exec_in_pod(pod, "kafka", ["curl", "-s", f"http://localhost:8083/connectors/{connector_name}/status"], timeout=10),
+        k8s_client.exec_in_pod(pod, "kafka", ["curl", "-s", f"http://localhost:8083/connectors/{connector_name}/config"], timeout=10),
+        k8s_client.exec_in_pod("redpanda-0", "kafka", ["rpk", "topic", "list", "--format", "json"], timeout=10),
+    )
+    result = {}
+    # Parse status for tasks
+    try:
+        status = j.loads(status_raw) if status_raw else {}
+        tasks_raw = status.get("tasks", [])
+        result["tasks"] = [{"id": t.get("id", 0), "state": t.get("state", "?"), "worker": t.get("worker_id", "?")} for t in tasks_raw]
+        result["connector_state"] = status.get("connector", {}).get("state", "UNKNOWN")
+    except Exception:
+        result["tasks"] = []
+    # Parse config for connector details
+    try:
+        cfg = j.loads(config_raw) if config_raw else {}
+        result["connector_class"] = cfg.get("connector.class", "")
+        result["capture_mode"] = cfg.get("capture.mode", cfg.get("signal.enabled.channels", "?"))
+        result["snapshot_mode"] = cfg.get("snapshot.mode", "?")
+        result["error_tolerance"] = cfg.get("errors.tolerance", "none")
+        result["dlq_topic"] = cfg.get("errors.deadletterqueue.topic.name", "none")
+        result["mongodb_connection"] = cfg.get("mongodb.connection.string", "?")
+        # Extract monitored collections
+        coll_str = cfg.get("collection.include.list", "")
+        if coll_str:
+            result["collections"] = [c.split(".")[-1] if "." in c else c for c in coll_str.split(",")]
+        else:
+            result["collections"] = []
+    except Exception:
+        pass
+    # Parse Redpanda topics (rpk topic list --format json)
+    try:
+        topics = j.loads(topics_raw) if topics_raw else []
+        if isinstance(topics, list):
+            result["topics"] = sorted([t.get("name", str(t)) if isinstance(t, dict) else str(t) for t in topics])
+        else:
+            result["topics"] = []
+    except Exception:
+        result["topics"] = []
+    return result
+
+
+@app.post("/api/v1/redpanda/debezium/{connector}/restart", dependencies=[Depends(verify_api_key)])
+async def restart_debezium(connector: str):
+    from devops import k8s_client
+    pod = await _find_debezium_pod()
+    if not pod:
+        return {"error": "No debezium pod found"}
+    raw = await k8s_client.exec_in_pod(pod, "kafka", ["curl", "-s", "-X", "POST", f"http://localhost:8083/connectors/{connector}/tasks/0/restart"], timeout=10)
+    return {"result": raw}
+
+
+# --- Certificates ---
+
+@app.get("/api/v1/certificates", dependencies=[Depends(verify_api_key)])
+async def list_certificates():
+    from devops import k8s_client
+    raw = await k8s_client._run_kubectl("get", "certificates", "-A", "-o", "json")
+    import json as j
+    try:
+        data = j.loads(raw) if raw else {"items": []}
+        return [{"name": i["metadata"]["name"], "namespace": i["metadata"]["namespace"],
+                 "ready": any(c.get("type") == "Ready" and c.get("status") == "True" for c in i.get("status", {}).get("conditions", []))}
+                for i in data.get("items", [])]
+    except Exception:
+        return []
+
+
+@app.get("/api/v1/certificates/status", dependencies=[Depends(verify_api_key)])
+async def certificate_status():
+    from devops import k8s_client
+    raw = await k8s_client._run_kubectl("get", "certificates", "-A")
+    return {"status": raw}
+
+
+@app.post("/api/v1/certificates/{name}/renew", dependencies=[Depends(verify_api_key)])
+async def renew_certificate(name: str):
+    from devops import k8s_client
+    result = await k8s_client._run_kubectl("delete", "secret", name, "-n", "default")
+    return {"result": result}
+
+
+# --- Tasks (ClawdBot task queue) ---
+
+@app.get("/api/v1/tasks", dependencies=[Depends(verify_api_key)])
+async def list_tasks():
+    # This will be populated by bot.py injecting the task_queue reference
+    if not hasattr(app.state, "task_queue"):
+        return []
+    return [
+        {
+            "id": t.id,
+            "context": t.context,
+            "prompt": t.prompt[:100],
+            "status": t.status.value,
+            "tools_used": t.tools_used,
+            "created_at": t.created_at,
+            "started_at": t.started_at,
+            "finished_at": t.finished_at,
+        }
+        for t in app.state.task_queue.get_recent(None, limit=20)
+    ]
+
+
+@app.post("/api/v1/tasks", dependencies=[Depends(verify_api_key)])
+async def create_task(request: Request):
+    data = await request.json()
+    if not hasattr(app.state, "task_queue"):
+        raise HTTPException(500, "Task queue not initialized")
+
+    context = data.get("context", "vm")
+    prompt = data["prompt"]
+    chat_id = data.get("chat_id", 0)
+
+    task = app.state.task_queue.add(chat_id, context, prompt)
+    return {"id": task.id, "status": "pending", "context": context}
+
+
+# --- SSE Streaming ---
+
+@app.get("/api/v1/tasks/{task_id}/stream", dependencies=[Depends(verify_api_key)])
+async def stream_task(task_id: int):
+    queue = broadcaster.subscribe_sse(task_id)
+
+    async def event_stream():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    yield f"data: {json.dumps({'type': 'keepalive'})}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            broadcaster.unsubscribe_sse(task_id, queue)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# --- WebSocket ---
+
+async def _handle_ws(websocket: WebSocket):
+    await websocket.accept()
+    broadcaster.add_ws(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+    except WebSocketDisconnect:
+        broadcaster.remove_ws(websocket)
+
+
+@app.websocket("/api/v1/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await _handle_ws(websocket)
+
+
+@app.websocket("/api/v1/dashboard/ws")
+async def websocket_dashboard(websocket: WebSocket):
+    await _handle_ws(websocket)
+
+
+# --- Static files (dashboard) ---
+
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.exists(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    @app.get("/")
+    async def serve_dashboard():
+        return FileResponse(os.path.join(static_dir, "index.html"))

@@ -4,6 +4,7 @@ import time
 from telegram import Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     ContextTypes,
@@ -440,11 +441,122 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle approval/rejection inline keyboard callbacks."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    if ":" not in data:
+        return
+
+    action, approval_id = data.split(":", 1)
+
+    from devops.approval import approve as approve_req, reject as reject_req
+    from devops.remediation import execute_playbook
+
+    if action == "approve":
+        result = approve_req(approval_id, decided_by=str(query.from_user.id))
+        if result:
+            await query.edit_message_text(
+                f"✅ *Approved* by {query.from_user.first_name}\n"
+                f"Playbook: {result['playbook']}\n"
+                f"Action: {result['action']}",
+                parse_mode="Markdown",
+            )
+            # Execute the approved action
+            asyncio.create_task(
+                execute_playbook(result["playbook"], context=result.get("context", {}), dry_run=False)
+            )
+        else:
+            await query.edit_message_text("Approval not found or already decided.")
+
+    elif action == "reject":
+        result = reject_req(approval_id, decided_by=str(query.from_user.id))
+        if result:
+            await query.edit_message_text(
+                f"❌ *Rejected* by {query.from_user.first_name}\n"
+                f"Playbook: {result['playbook']}\n"
+                f"Action: {result['action']}",
+                parse_mode="Markdown",
+            )
+        else:
+            await query.edit_message_text("Approval not found or already decided.")
+
+
 async def post_init(application: Application):
     global executor
     executor = Executor(task_queue, ctx_mgr, application)
     asyncio.create_task(executor.start())
     logger.info("Executor background task started")
+
+    # Start DevOps monitoring and API server
+    if config.DEVOPS_ENABLED:
+        try:
+            # Configure Telegram notifications
+            from devops import notifications
+            if config.ALERT_CHAT_ID:
+                notifications.configure(application.bot, config.ALERT_CHAT_ID)
+
+            # Register event listeners
+            from devops.event_bus import event_bus
+            event_bus.on("incident_created", _on_incident_created)
+            event_bus.on("incident_resolved", _on_incident_resolved)
+            event_bus.on("approval_requested", _on_approval_requested)
+            event_bus.on("service_critical", _on_service_critical)
+
+            # Register auto-remediation
+            from devops.auto_remediation import register_auto_remediation
+            register_auto_remediation()
+
+            # Start background monitors
+            from devops.scheduler import setup_scheduler
+            setup_scheduler()
+
+            # Start FastAPI server
+            asyncio.create_task(_start_api_server())
+
+            logger.info("DevOps monitoring and API server initialized")
+        except Exception:
+            logger.exception("Failed to initialize DevOps module")
+
+
+async def _on_incident_created(incident):
+    from devops.notifications import send_incident_alert
+    await send_incident_alert(incident)
+
+
+async def _on_incident_resolved(incident):
+    from devops.notifications import send_incident_resolved
+    await send_incident_resolved(incident)
+
+
+async def _on_approval_requested(approval):
+    from devops.notifications import send_approval_request
+    await send_approval_request(approval)
+
+
+async def _on_service_critical(service: str):
+    from devops.notifications import send_alert
+    await send_alert(f"🔴 *Service Critical*: {service}")
+
+
+async def _start_api_server():
+    """Start uvicorn FastAPI server in the background."""
+    import uvicorn
+    from api_server import app as api_app
+
+    # Inject task_queue reference into API app
+    api_app.state.task_queue = task_queue
+
+    server_config = uvicorn.Config(
+        api_app,
+        host="0.0.0.0",
+        port=config.API_PORT,
+        log_level="warning",
+    )
+    server = uvicorn.Server(server_config)
+    await server.serve()
 
 
 def main():
@@ -463,6 +575,7 @@ def main():
     app.add_handler(CommandHandler("tasks", cmd_tasks))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("shell", cmd_shell))
+    app.add_handler(CallbackQueryHandler(handle_approval_callback))
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,

@@ -1,0 +1,1131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AiDevOps - OneShell Infrastructure</title>
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+    <link rel="icon" type="image/png" href="/static/favicon.png">
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+</head>
+<body x-data="dashboard" x-init="init()">
+    <header>
+        <div class="header-left">
+            <h1>AiDevOps</h1>
+            <span class="subtitle">OneShell Infrastructure Overview</span>
+        </div>
+        <div class="header-right">
+            <span class="health-badge" :class="overview.health_score?.status || 'unknown'"
+                  x-text="(overview.health_score?.overall ?? '--') + '%'"></span>
+            <span class="ws-status" :class="wsConnected ? 'connected' : 'disconnected'"
+                  x-text="wsConnected ? 'Live' : 'Offline'"></span>
+        </div>
+    </header>
+
+    <nav>
+        <button :class="tab === 'overview' && 'active'" @click="tab = 'overview'">Overview</button>
+        <button :class="tab === 'services' && 'active'" @click="tab = 'services'">Services</button>
+        <button :class="tab === 'topology' && 'active'" @click="tab = 'topology'; $nextTick(() => renderTopology())">Topology</button>
+        <button :class="tab === 'kubernetes' && 'active'" @click="tab = 'kubernetes'; loadK8s()">Kubernetes</button>
+        <button :class="tab === 'nodes' && 'active'" @click="tab = 'nodes'; loadNodes()">Nodes</button>
+        <button :class="tab === 'mongodb' && 'active'" @click="tab = 'mongodb'; loadMongo()">MongoDB</button>
+        <button :class="tab === 'nats' && 'active'" @click="tab = 'nats'; loadNats()">NATS</button>
+        <button :class="tab === 'redpanda' && 'active'" @click="tab = 'redpanda'; loadRedpanda()">Redpanda</button>
+        <button :class="tab === 'dragonfly' && 'active'" @click="tab = 'dragonfly'; loadDragonfly()">Dragonfly</button>
+        <button :class="tab === 'certs' && 'active'" @click="tab = 'certs'; loadCerts()">Certs</button>
+        <button :class="tab === 'o2' && 'active'" @click="tab = 'o2'; loadO2()">OpenObserve</button>
+        <button :class="tab === 'logs' && 'active'" @click="tab = 'logs'">Log Analysis</button>
+        <button :class="tab === 'issues' && 'active'" @click="tab = 'issues'; loadIssues()">
+            Issues <span x-show="issueCount > 0" class="badge critical" x-text="issueCount"></span>
+        </button>
+        <button :class="tab === 'incidents' && 'active'" @click="tab = 'incidents'; loadIncidents()">
+            Incidents <span x-show="overview.active_incidents > 0" class="badge" x-text="overview.active_incidents"></span>
+        </button>
+        <button :class="tab === 'remediation' && 'active'" @click="tab = 'remediation'; loadPlaybooks()">Remediation</button>
+    </nav>
+
+    <main>
+        <!-- Overview Tab -->
+        <div x-show="tab === 'overview'" class="tab-content">
+            <!-- Row 1: Key metrics -->
+            <div class="cards">
+                <div class="card" :class="overview.health_score?.status || 'unknown'">
+                    <h3>Health Score</h3>
+                    <div class="big-number" x-text="(overview.health_score?.overall ?? '--') + '%'"></div>
+                    <span x-text="overview.health_score?.status || 'loading...'"></span>
+                </div>
+                <div class="card">
+                    <h3>Services</h3>
+                    <div class="big-number" x-text="(overview.services_healthy || 0) + '/' + ((overview.services_healthy||0)+(overview.services_degraded||0)+(overview.services_critical||0))"></div>
+                    <div class="stat-row">
+                        <span class="stat healthy" x-text="overview.services_healthy || 0"></span> ok
+                        <span class="stat degraded" x-text="overview.services_degraded || 0"></span> warn
+                        <span class="stat critical" x-text="overview.services_critical || 0"></span> down
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>Pods</h3>
+                    <div class="big-number" x-text="(overview.pods_running || 0) + '/' + (overview.pods_total || 0)"></div>
+                    <span>running across 6 namespaces</span>
+                </div>
+                <div class="card" :class="overview.active_incidents > 0 ? 'warning' : ''">
+                    <h3>Active Incidents</h3>
+                    <div class="big-number" x-text="overview.active_incidents || 0"></div>
+                </div>
+            </div>
+
+            <!-- Row 2: Infrastructure at a glance -->
+            <div class="cards">
+                <div class="card" :class="dashMongo.status === 'healthy' ? 'healthy' : dashMongo.status === 'unknown' ? '' : 'critical'">
+                    <h3>MongoDB</h3>
+                    <div x-text="'v' + (dashMongo.version || '...')"></div>
+                    <div class="stat-row">
+                        <span class="stat" x-text="dashMongo.connections?.current || 0"></span> conns
+                        <span class="stat" x-text="dashMongo.logical_sessions || 0"></span> sessions
+                    </div>
+                    <div style="font-size:11px; color:var(--text-dim)" x-text="'Uptime: ' + formatUptime(dashMongo.uptime_seconds)"></div>
+                </div>
+                <div class="card" :class="dashNats.status === 'healthy' ? 'healthy' : dashNats.status ? 'critical' : ''">
+                    <h3>NATS JetStream</h3>
+                    <div class="stat-row">
+                        <span class="stat" x-text="dashNats.connections ?? '--'"></span> conns
+                        <span class="stat" x-text="dashNats.subscriptions ?? '--'"></span> subs
+                        <span class="stat" x-text="(dashNats.streams?.length ?? dashNats.streams ?? 0)"></span> streams
+                    </div>
+                    <div x-show="dashNats.version" style="font-size:11px; color:var(--text-dim)" x-text="'v' + dashNats.version"></div>
+                    <div x-show="dashNats.dlq_messages > 0" class="error" x-text="dashNats.dlq_messages + ' DLQ messages'"></div>
+                </div>
+                <div class="card" :class="dashDragonfly.memory_percent > 80 ? 'warning' : 'healthy'">
+                    <h3>Dragonfly</h3>
+                    <div class="stat-row">
+                        <span class="stat" x-text="dashDragonfly.memory_used || '?'"></span>
+                        <span class="stat" x-text="(dashDragonfly.hit_rate || 0) + '%'"></span> hit rate
+                    </div>
+                    <div style="font-size:11px; color:var(--text-dim)" x-text="(dashDragonfly.connected_clients || 0) + ' clients'"></div>
+                </div>
+                <div class="card" :class="dashRedpanda.ready ? 'healthy' : 'critical'">
+                    <h3>Redpanda + Debezium</h3>
+                    <div class="stat-row">
+                        <span class="status-badge" :class="dashRedpanda.ready ? 'healthy' : 'critical'" x-text="dashRedpanda.ready ? 'Broker OK' : 'Broker Down'"></span>
+                        <span x-text="(dashRedpanda.brokers?.[0]?.version?.split(' ')?.[0] || '?')"></span>
+                    </div>
+                    <div style="font-size:11px; margin-top:4px;">
+                        <span x-text="(dashRedpanda.topic_count || 0) + ' topics'"></span> |
+                        <span x-text="(dashRedpanda.partition_count || 0) + ' partitions'"></span>
+                    </div>
+                    <div style="font-size:11px; margin-top:2px;"
+                         :style="'color:' + (dashDebezium.state === 'RUNNING' ? 'var(--healthy)' : 'var(--critical)')">
+                        Debezium: <strong x-text="dashDebezium.state || 'unknown'"></strong>
+                        <span x-text="'(' + (dashDebezium.tasks || 0) + ' tasks)'"></span>
+                    </div>
+                    <div x-show="dashDebezium.state" style="font-size:10px; color:var(--text-dim); margin-top:2px;"
+                         x-text="(dashRedpanda.topic_count || 0) + ' topics'"></div>
+                </div>
+            </div>
+
+            <!-- Row 3: Nodes + Service Chart side by side -->
+            <div style="display:grid; grid-template-columns: 1fr 300px; gap:16px;">
+                <div class="section">
+                    <h3>Cluster Nodes</h3>
+                    <template x-for="n in dashNodes">
+                        <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px; font-size:13px;">
+                            <span style="width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" x-text="n.name"></span>
+                            <span style="width:50px; text-align:right;" x-text="n.cpu_percent + '%'"></span>
+                            <div style="flex:1; height:8px; background:var(--border); border-radius:4px; overflow:hidden;">
+                                <div :style="'width:' + n.cpu_percent + '%; height:100%; border-radius:4px; background:' + (n.cpu_percent > 80 ? 'var(--critical)' : n.cpu_percent > 50 ? 'var(--degraded)' : 'var(--healthy)')"></div>
+                            </div>
+                            <span style="width:50px; text-align:right;" x-text="n.memory_percent + '%'"></span>
+                            <div style="flex:1; height:8px; background:var(--border); border-radius:4px; overflow:hidden;">
+                                <div :style="'width:' + n.memory_percent + '%; height:100%; border-radius:4px; background:' + (n.memory_percent > 80 ? 'var(--critical)' : n.memory_percent > 50 ? 'var(--degraded)' : 'var(--info)')"></div>
+                            </div>
+                        </div>
+                    </template>
+                    <div x-show="!dashNodes.length" class="empty" style="padding:10px">Loading nodes...</div>
+                </div>
+                <div class="section">
+                    <h3>Service Status</h3>
+                    <div style="height: 220px; position: relative;">
+                        <canvas id="statusChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Row 4: Alerts -->
+            <div class="section" x-show="overview.health_score?.warnings?.length > 0 || overview.health_score?.critical_issues?.length > 0">
+                <h3>Alerts</h3>
+                <template x-for="issue in (overview.health_score?.critical_issues || [])">
+                    <div class="alert critical" x-text="issue"></div>
+                </template>
+                <template x-for="warn in (overview.health_score?.warnings || [])">
+                    <div class="alert warning" x-text="warn"></div>
+                </template>
+            </div>
+
+            <!-- Autodetect & Fix Panel -->
+            <div class="section" style="border-left: 3px solid var(--healthy);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                    <h3 style="color:var(--healthy); margin:0;">Autodetect &amp; Fix</h3>
+                    <button class="btn" @click="runAutodetect()" :disabled="autodetectRunning">
+                        <span x-text="autodetectRunning ? 'Scanning infrastructure...' : 'Scan All Systems'"></span>
+                    </button>
+                </div>
+
+                <!-- Issues list - each with Fix + Deploy buttons -->
+                <div x-show="autodetectResult">
+                    <div x-show="autodetectResult?.total > 0" style="margin-bottom:8px; font-size:13px;">
+                        Found <strong x-text="autodetectResult?.total || 0"></strong> issues
+                        (<span style="color:var(--critical);" x-text="autodetectResult?.critical || 0"></span> critical,
+                        <span style="color:var(--degraded);" x-text="autodetectResult?.warning || 0"></span> warnings)
+                    </div>
+
+                    <template x-for="(issue, idx) in (autodetectResult?.issues || [])">
+                        <div style="margin-bottom:8px; border:1px solid var(--border); border-radius:8px; overflow:hidden;"
+                             :style="'border-left:3px solid ' + (issue.severity === 'critical' ? 'var(--critical)' : 'var(--degraded)')">
+                            <!-- Issue header -->
+                            <div style="display:flex; justify-content:space-between; align-items:center; padding:10px 12px; gap:8px;">
+                                <div style="display:flex; gap:6px; align-items:center; flex:1; min-width:0;">
+                                    <span class="badge" :class="issue.severity" x-text="issue.severity" style="flex-shrink:0;"></span>
+                                    <span style="color:var(--info); font-weight:600; font-size:11px; flex-shrink:0;" x-text="issue.source"></span>
+                                    <span style="font-size:12px; overflow:hidden; text-overflow:ellipsis;" x-text="issue.detail"></span>
+                                </div>
+                                <div style="display:flex; gap:4px; flex-shrink:0;">
+                                    <button class="btn btn-sm" @click="diagnoseIssue(issue)"
+                                            :disabled="issue._fixing" x-show="!issue._fixResult">
+                                        <span x-text="issue._fixing ? 'Analyzing...' : 'Diagnose'"></span>
+                                    </button>
+                                    <button x-show="issue._fixResult?.status === 'plan_ready'" class="btn btn-sm"
+                                            style="background:var(--healthy);"
+                                            @click="executePlan(issue, false)" :disabled="issue._executing">
+                                        <span x-text="issue._executing ? 'Executing...' : 'Approve & Execute'"></span>
+                                    </button>
+                                    <button x-show="issue._fixResult?.status === 'plan_ready'" class="btn btn-sm"
+                                            style="background:var(--accent);"
+                                            @click="executePlan(issue, true)" :disabled="issue._executing">
+                                        <span x-text="issue._executing ? 'Agent running...' : 'AI Agent Fix'"></span>
+                                    </button>
+                                    <button x-show="issue._fixResult?.deploy_command" class="btn btn-sm"
+                                            style="background:var(--info);"
+                                            @click="deployService(issue)">Deploy</button>
+                                    <button x-show="issue._fixResult" class="btn btn-sm"
+                                            @click="diagnoseIssue(issue)" :disabled="issue._fixing">Retry</button>
+                                </div>
+                            </div>
+
+                            <!-- Fix progress (expands when fixing) -->
+                            <div x-show="issue._fixProgress || issue._fixResult" style="padding:0 12px 10px 12px; border-top:1px solid var(--border);">
+                                <!-- Real-time progress messages -->
+                                <template x-for="msg in (issue._fixProgress || [])">
+                                    <div style="display:flex; gap:6px; align-items:center; padding:3px 0; font-size:11px;">
+                                        <span :style="'color:' + (msg.includes('done') || msg.includes('complete') ? 'var(--healthy)' : msg.includes('ERROR') ? 'var(--critical)' : 'var(--degraded)')">&#9679;</span>
+                                        <span style="color:var(--text-dim);" x-text="msg"></span>
+                                    </div>
+                                </template>
+
+                                <!-- Diagnosis -->
+                                <div x-show="issue._fixResult?.diagnosis" class="alert info" style="margin:8px 0 6px 0; padding:6px 10px; font-size:12px;">
+                                    <strong>Diagnosis:</strong> <span x-text="issue._fixResult?.diagnosis"></span>
+                                </div>
+
+                                <!-- Fix steps -->
+                                <template x-for="(step, si) in (issue._fixResult?.steps || [])">
+                                    <div style="padding:6px 8px; margin:4px 0; border-radius:4px; font-size:11px; border-left:2px solid;"
+                                         :style="'border-color:' + (step.risk === 'high' ? 'var(--critical)' : step.risk === 'medium' ? 'var(--degraded)' : 'var(--healthy)')">
+                                        <div style="display:flex; gap:4px; align-items:center; justify-content:space-between;">
+                                            <div style="display:flex; gap:4px; align-items:center;">
+                                                <span x-show="issue._fixResult?.executed_steps?.[si]?.success === true" style="color:var(--healthy);">&#10003;</span>
+                                                <span x-show="issue._fixResult?.executed_steps?.[si]?.success === false" style="color:var(--critical);">&#10007;</span>
+                                                <span class="badge" :class="step.risk === 'high' ? 'critical' : step.risk === 'medium' ? 'warning' : 'info'" x-text="'Step ' + (si+1) + ' (' + step.risk + ')'" style="font-size:10px;"></span>
+                                                <span x-text="step.description"></span>
+                                            </div>
+                                            <button x-show="step.command && !issue._fixResult?.executed_steps?.[si]"
+                                                    class="btn btn-sm" style="font-size:10px; padding:2px 8px;"
+                                                    @click="runStep(issue, si, step.command)">Run</button>
+                                        </div>
+                                        <code style="display:block; font-size:10px; color:var(--text-dim); margin-top:3px; word-break:break-all;" x-text="step.command"></code>
+                                        <pre x-show="issue._fixResult?.executed_steps?.[si]?.output"
+                                             style="font-size:10px; margin-top:3px; padding:4px; background:var(--bg); border-radius:3px; white-space:pre-wrap; max-height:80px; overflow-y:auto;"
+                                             :style="'color:' + (issue._fixResult?.executed_steps?.[si]?.success ? 'var(--healthy)' : 'var(--critical)')"
+                                             x-text="issue._fixResult?.executed_steps?.[si]?.output"></pre>
+                                    </div>
+                                </template>
+
+                                <!-- Agent log (when AI Agent Fix is used) -->
+                                <div x-show="issue._agentLog?.length > 0" style="margin-top:8px;">
+                                    <h4 style="font-size:12px; color:var(--accent); margin-bottom:4px;">AI Agent Activity:</h4>
+                                    <div style="background:var(--bg); border-radius:4px; padding:8px; max-height:300px; overflow-y:auto; font-family:monospace; font-size:10px; line-height:1.6;">
+                                        <template x-for="log in (issue._agentLog || [])">
+                                            <div :style="'color:' + (log.type === 'tool_call' ? 'var(--degraded)' : log.type === 'result' ? 'var(--healthy)' : 'var(--text-dim)')">
+                                                <span style="color:var(--info);" x-text="'[' + log.type + ']'"></span>
+                                                <span x-text="log.text"></span>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </div>
+
+                                <div x-show="issue._fixResult?.duration_ms" style="font-size:10px; color:var(--text-dim); margin-top:4px;"
+                                     x-text="'AI analysis: ' + ((issue._fixResult?.duration_ms || 0)/1000).toFixed(1) + 's'"></div>
+
+                                <!-- Manual command + retry -->
+                                <div x-show="issue._fixResult" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border);">
+                                    <div style="display:flex; gap:4px; align-items:center;">
+                                        <input type="text" x-model="issue._manualCmd"
+                                               :placeholder="'Run a command for ' + issue.service + '...'"
+                                               style="flex:1; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px 8px; font-family:monospace; font-size:11px;"
+                                               @keydown.enter="runManualCmd(issue)">
+                                        <button class="btn btn-sm" @click="runManualCmd(issue)" :disabled="!issue._manualCmd?.trim()">Run</button>
+                                        <button class="btn btn-sm" @click="diagnoseIssue(issue)" :disabled="issue._fixing">Retry AI</button>
+                                    </div>
+                                    <pre x-show="issue._manualOutput"
+                                         style="font-size:10px; margin-top:4px; padding:6px; background:var(--bg); border-radius:4px; white-space:pre-wrap; max-height:120px; overflow-y:auto; color:var(--text);"
+                                         x-text="issue._manualOutput"></pre>
+                                </div>
+                            </div>
+                        </div>
+                    </template>
+
+                    <div x-show="autodetectResult?.total === 0" class="empty" style="padding:20px; color:var(--healthy);">
+                        All systems healthy - no issues detected
+                    </div>
+                </div>
+            </div>
+
+            <!-- AI Error Fix Panel -->
+            <div class="section" style="border-left: 3px solid var(--accent);">
+                <h3 style="color:var(--accent);">AI Error Diagnosis</h3>
+                <p style="font-size:12px; color:var(--text-dim); margin-bottom:12px;">Paste any error from logs, Kubernetes events, or monitoring alerts. Claude AI will diagnose and suggest fixes.</p>
+                <div style="display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap;">
+                    <select x-model="aiFixService" style="width:180px;">
+                        <option value="">Any service</option>
+                        <option value="PosServerBackend">PosServerBackend</option>
+                        <option value="PosClientBackend">PosClientBackend</option>
+                        <option value="MongoDbService">MongoDbService</option>
+                        <option value="GatewayService">GatewayService</option>
+                        <option value="BusinessService">BusinessService</option>
+                        <option value="PosService">PosService</option>
+                        <option value="Scheduler">Scheduler</option>
+                        <option value="QuartzScheduler">QuartzScheduler</option>
+                        <option value="NATS">NATS</option>
+                        <option value="MongoDB">MongoDB</option>
+                        <option value="Redpanda">Redpanda</option>
+                    </select>
+                    <button class="btn" @click="submitAiFix(false)" :disabled="aiFixLoading || !aiFixError.trim()">Diagnose</button>
+                    <button class="btn btn-danger" @click="submitAiFix(true)" :disabled="aiFixLoading || !aiFixError.trim()">Diagnose + Auto-Fix</button>
+                    <span x-show="aiFixLoading" style="color:var(--text-dim); font-size:12px;">Analyzing with Claude CLI...</span>
+                </div>
+                <textarea x-model="aiFixError" rows="4" placeholder="Paste error message, stack trace, or describe the problem..."
+                    style="width:100%; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:10px; font-family:monospace; font-size:12px; resize:vertical;"></textarea>
+                <div x-show="aiFixResult" style="margin-top:12px;">
+                    <div class="alert" :class="aiFixResult?.severity === 'critical' ? 'critical' : aiFixResult?.severity === 'warning' ? 'warning' : 'info'">
+                        <strong>Diagnosis:</strong> <span x-text="aiFixResult?.diagnosis"></span>
+                    </div>
+                    <div x-show="aiFixResult?.prevention" style="font-size:12px; color:var(--text-dim); margin:8px 0;">
+                        <strong>Prevention:</strong> <span x-text="aiFixResult?.prevention"></span>
+                    </div>
+                    <div x-show="aiFixResult?.fix_steps?.length > 0" style="margin-top:8px;">
+                        <h4 style="font-size:13px; margin-bottom:6px;">Fix Steps:</h4>
+                        <template x-for="(step, i) in (aiFixResult?.fix_steps || [])">
+                            <div class="action-result" :class="step.risk === 'low' ? 'completed' : ''">
+                                <div style="display:flex; gap:6px; align-items:center;">
+                                    <span class="badge" :class="step.risk === 'high' ? 'critical' : step.risk === 'medium' ? 'warning' : 'info'" x-text="step.risk"></span>
+                                    <span x-text="step.description"></span>
+                                    <span x-show="step.auto_safe" class="badge info">auto-safe</span>
+                                </div>
+                                <code style="display:block; margin-top:4px; font-size:11px; color:var(--text-dim); word-break:break-all;" x-text="step.command"></code>
+                            </div>
+                        </template>
+                    </div>
+                    <div x-show="aiFixResult?.executed?.length > 0" style="margin-top:8px;">
+                        <h4 style="font-size:13px; color:var(--healthy); margin-bottom:6px;">Executed:</h4>
+                        <template x-for="ex in (aiFixResult?.executed || [])">
+                            <div class="action-result completed">
+                                <code x-text="ex.command"></code>
+                                <pre style="font-size:11px; margin-top:4px; white-space:pre-wrap;" x-text="ex.output"></pre>
+                            </div>
+                        </template>
+                    </div>
+                    <div style="font-size:11px; color:var(--text-dim); margin-top:6px;" x-text="'Analysis took ' + (aiFixResult?.duration_ms/1000).toFixed(1) + 's'"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Services Tab -->
+        <div x-show="tab === 'services'" class="tab-content">
+            <h2>Service Health</h2>
+            <div class="service-grid">
+                <template x-for="svc in services">
+                    <div class="service-card" :class="svc.status">
+                        <h4 x-text="svc.name"></h4>
+                        <span class="ns" x-text="svc.namespace"></span>
+                        <div class="status-badge" :class="svc.status" x-text="svc.status"></div>
+                        <div x-show="svc.response_time_ms" class="response-time" x-text="svc.response_time_ms + 'ms'"></div>
+                        <div x-show="svc.error" class="error" x-text="svc.error"></div>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <!-- Topology Tab -->
+        <div x-show="tab === 'topology'" class="tab-content">
+            <h2>Service Topology</h2>
+            <div id="topology-container"></div>
+        </div>
+
+        <!-- Kubernetes Tab -->
+        <div x-show="tab === 'kubernetes'" class="tab-content">
+            <h2>Kubernetes</h2>
+            <div class="section">
+                <h3>Pods</h3>
+                <select x-model="k8sNamespace" @change="loadK8s()">
+                    <option value="default">default</option>
+                    <option value="pos">pos</option>
+                    <option value="mongodb">mongodb</option>
+                    <option value="argocd">argocd</option>
+                </select>
+                <table>
+                    <thead><tr><th>Name</th><th>Status</th><th>Ready</th><th>Restarts</th><th>Node</th></tr></thead>
+                    <tbody>
+                        <template x-for="pod in pods">
+                            <tr :class="pod.restarts > 5 ? 'warning-row' : ''">
+                                <td x-text="pod.name"></td>
+                                <td><span class="status-dot" :class="pod.status === 'Running' ? 'healthy' : 'critical'"></span> <span x-text="pod.status"></span></td>
+                                <td x-text="pod.ready ? 'Yes' : 'No'"></td>
+                                <td x-text="pod.restarts"></td>
+                                <td x-text="pod.node"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+            <div class="section">
+                <h3>Recent Events</h3>
+                <table>
+                    <thead><tr><th>Type</th><th>Reason</th><th>Object</th><th>Message</th></tr></thead>
+                    <tbody>
+                        <template x-for="ev in k8sEvents">
+                            <tr :class="ev.type === 'Warning' ? 'warning-row' : ''">
+                                <td x-text="ev.type"></td>
+                                <td x-text="ev.reason"></td>
+                                <td x-text="ev.object"></td>
+                                <td x-text="ev.message?.substring(0, 120)"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- MongoDB Tab -->
+        <div x-show="tab === 'mongodb'" class="tab-content">
+            <h2>MongoDB</h2>
+            <div class="cards">
+                <div class="card" :class="mongoHealth.status">
+                    <h3>Status</h3>
+                    <div class="status-badge" :class="mongoHealth.status" x-text="mongoHealth.status"></div>
+                </div>
+                <div class="card">
+                    <h3>Connections</h3>
+                    <div class="big-number" x-text="mongoHealth.connections?.current ?? '--'"></div>
+                    <span>/ <span x-text="mongoHealth.connections?.available ?? '--'"></span> available</span>
+                </div>
+                <div class="card">
+                    <h3>Sessions</h3>
+                    <div class="big-number" x-text="mongoHealth.logical_sessions ?? '--'"></div>
+                </div>
+                <div class="card">
+                    <h3>Version</h3>
+                    <div x-text="mongoHealth.version || '--'"></div>
+                </div>
+            </div>
+            <div class="section">
+                <h3>Sync Errors (unresolved)</h3>
+                <button class="btn" @click="loadSyncErrors()">Refresh</button>
+                <table x-show="syncErrors.length > 0">
+                    <thead><tr><th>Collection</th><th>Error Type</th><th>Business ID</th><th>Retries</th></tr></thead>
+                    <tbody>
+                        <template x-for="err in syncErrors">
+                            <tr>
+                                <td x-text="err.collection"></td>
+                                <td x-text="err.error_type || err.errorType"></td>
+                                <td x-text="err.business_id || err.businessId"></td>
+                                <td x-text="err.retry_count || err.retryCount"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+                <div x-show="syncErrors.length === 0" class="empty">No unresolved sync errors</div>
+            </div>
+        </div>
+
+        <!-- NATS Tab -->
+        <div x-show="tab === 'nats'" class="tab-content">
+            <h2>NATS JetStream</h2>
+            <div class="cards">
+                <div class="card" :class="natsHealth.status">
+                    <h3>Status</h3>
+                    <div class="status-badge" :class="natsHealth.status" x-text="natsHealth.status"></div>
+                    <div style="font-size:11px; color:var(--text-dim)" x-text="'v' + (natsHealth.version || '?')"></div>
+                </div>
+                <div class="card">
+                    <h3>Connections</h3>
+                    <div class="big-number" x-text="natsHealth.connections ?? '--'"></div>
+                    <div style="font-size:11px; color:var(--text-dim)" x-text="(natsHealth.subscriptions || 0) + ' subscriptions'"></div>
+                </div>
+                <div class="card" :class="natsHealth.dlq_messages > 0 ? 'warning' : ''">
+                    <h3>DLQ Messages</h3>
+                    <div class="big-number" :class="natsHealth.dlq_messages > 0 ? 'warning-text' : ''" x-text="natsHealth.dlq_messages ?? 0"></div>
+                    <div x-show="natsHealth.dlq_messages > 0" style="margin-top:6px;">
+                        <button class="btn btn-sm" @click="natsAction('dlq/replay?limit=10', 'Replay 10 DLQ messages?')">Replay 10</button>
+                        <button class="btn btn-sm btn-danger" @click="natsAction('dlq/purge', 'PURGE all DLQ messages? This cannot be undone.')">Purge DLQ</button>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>Throughput</h3>
+                    <div style="font-size:12px;">
+                        In: <strong x-text="natsHealth.in_msgs ?? 0"></strong> msgs
+                        Out: <strong x-text="natsHealth.out_msgs ?? 0"></strong> msgs
+                    </div>
+                </div>
+            </div>
+            <div class="section">
+                <h3>Streams</h3>
+                <table>
+                    <thead><tr><th>Name</th><th>Messages</th><th>Bytes</th><th>Consumers</th><th>Actions</th></tr></thead>
+                    <tbody>
+                        <template x-for="s in natsStreams">
+                            <tr :class="s.name.includes('dlq') ? 'warning-row' : ''">
+                                <td><strong x-text="s.name"></strong></td>
+                                <td x-text="s.messages"></td>
+                                <td x-text="formatBytes(s.bytes)"></td>
+                                <td x-text="s.consumer_count"></td>
+                                <td>
+                                    <button class="btn btn-sm" @click="natsAction('streams/' + s.name + '/peek', 'Peek at messages?')">Peek</button>
+                                    <button x-show="s.messages > 0" class="btn btn-sm btn-danger" @click="natsAction('streams/' + s.name + '/purge', 'PURGE all messages from ' + s.name + '?')">Purge</button>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+            <div class="section">
+                <h3>Consumers</h3>
+                <table>
+                    <thead><tr><th>Name</th><th>Stream</th><th>Pending</th><th>Ack Pending</th><th>Redelivered</th><th>Actions</th></tr></thead>
+                    <tbody>
+                        <template x-for="c in natsConsumers">
+                            <tr :class="c.num_pending > 100 ? 'warning-row' : ''">
+                                <td><strong x-text="c.name"></strong></td>
+                                <td x-text="c.stream"></td>
+                                <td x-text="c.num_pending"></td>
+                                <td x-text="c.num_ack_pending"></td>
+                                <td x-text="c.num_redelivered"></td>
+                                <td>
+                                    <button class="btn btn-sm" @click="natsAction('consumers/' + c.stream + '/' + c.name + '/pause', 'Pause consumer ' + c.name + '?')">Pause</button>
+                                    <button class="btn btn-sm" @click="natsAction('consumers/' + c.stream + '/' + c.name + '/resume', 'Resume consumer ' + c.name + '?')">Resume</button>
+                                    <button class="btn btn-sm btn-danger" @click="natsAction('consumers/' + c.stream + '/' + c.name + '/reset', 'RESET consumer ' + c.name + '? This will lose position.')">Reset</button>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+            <div x-show="natsActionResult" class="section">
+                <h3>Action Result</h3>
+                <pre style="font-size:12px; white-space:pre-wrap; max-height:300px; overflow-y:auto;" x-text="natsActionResult"></pre>
+            </div>
+        </div>
+
+        <!-- Redpanda Tab -->
+        <div x-show="tab === 'redpanda'" class="tab-content">
+            <h2>Redpanda + Debezium CDC</h2>
+
+            <!-- Debezium CDC Status Banner -->
+            <div class="section" style="margin-bottom: 16px; padding: 16px; border-left: 4px solid;"
+                 :style="'border-color:' + (redpandaData.debezium_failed > 0 ? 'var(--critical)' : 'var(--healthy)')">
+                <div style="display:flex; align-items:center; gap:24px; flex-wrap:wrap;">
+                    <div>
+                        <div style="font-size:11px; text-transform:uppercase; color:var(--text-dim);">Debezium CDC</div>
+                        <div style="font-size:28px; font-weight:700;"
+                             :style="'color:' + (redpandaData.debezium_failed > 0 ? 'var(--critical)' : 'var(--healthy)')"
+                             x-text="redpandaData.debezium_failed > 0 ? 'FAILED' : (redpandaData.debezium_connectors?.length > 0 ? 'RUNNING' : 'DOWN')"></div>
+                    </div>
+                    <div style="display:flex; gap:20px; font-size:13px;">
+                        <div><strong x-text="redpandaData.debezium_connectors?.length || 0"></strong> connectors</div>
+                        <div><strong x-text="redpandaData.debezium_connectors?.reduce((s,c) => s + (c.tasks||0), 0) || 0"></strong> tasks</div>
+                        <div x-show="redpandaData.debezium_failed > 0" style="color:var(--critical);"><strong x-text="redpandaData.debezium_failed"></strong> failed</div>
+                    </div>
+                    <button x-show="redpandaData.debezium_failed > 0" class="btn btn-sm btn-danger" @click="restartDebezium('oneshell-mongodb-connector')">Restart Failed Tasks</button>
+                </div>
+            </div>
+
+            <!-- Cards row -->
+            <div class="cards">
+                <div class="card" :class="redpandaData.broker?.ready ? 'healthy' : 'critical'">
+                    <h3>Redpanda Broker</h3>
+                    <div class="status-badge" :class="redpandaData.broker?.ready ? 'healthy' : 'critical'"
+                         x-text="redpandaData.broker?.ready ? 'Healthy' : 'Down'"></div>
+                    <div style="font-size:11px; color:var(--text-dim); margin-top:4px;"
+                         x-text="(redpandaData.broker?.brokers?.[0]?.version?.split(' ')?.[0] || '?')"></div>
+                    <div style="font-size:11px; color:var(--text-dim);"
+                         x-text="(redpandaData.broker?.partition_count || 0) + ' partitions'"></div>
+                </div>
+                <div class="card">
+                    <h3>Broker Storage</h3>
+                    <div x-show="redpandaData.broker?.brokers?.[0]?.disk_space?.[0]" style="font-size:12px;">
+                        <div x-text="formatBytes(redpandaData.broker?.brokers?.[0]?.disk_space?.[0]?.total - redpandaData.broker?.brokers?.[0]?.disk_space?.[0]?.free) + ' used'"></div>
+                        <div style="color:var(--text-dim);" x-text="formatBytes(redpandaData.broker?.brokers?.[0]?.disk_space?.[0]?.free) + ' free / ' + formatBytes(redpandaData.broker?.brokers?.[0]?.disk_space?.[0]?.total) + ' total'"></div>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>Debezium Connect</h3>
+                    <div style="font-size:12px;" x-text="debeziumDetail.connector_class ? debeziumDetail.connector_class.split('.').pop() : '?'"></div>
+                    <div style="font-size:11px; color:var(--text-dim);" x-text="'Capture: ' + (debeziumDetail.capture_mode || '?')"></div>
+                    <div style="font-size:11px; color:var(--text-dim);" x-text="'Snapshot: ' + (debeziumDetail.snapshot_mode || '?')"></div>
+                    <div style="font-size:11px; color:var(--text-dim);" x-text="'Errors: ' + (debeziumDetail.error_tolerance || '?')"></div>
+                </div>
+                <div class="card">
+                    <h3>DLQ</h3>
+                    <div style="font-size:12px;" x-text="'Topic: ' + (debeziumDetail.dlq_topic || 'none')"></div>
+                    <div style="font-size:11px; color:var(--text-dim);" x-text="'MongoDB: ' + (debeziumDetail.mongodb_connection ? debeziumDetail.mongodb_connection.replace(/\/\/[^@]+@/, '//***@') : '?')"></div>
+                </div>
+            </div>
+
+            <!-- Monitored Collections -->
+            <div class="section">
+                <h3>Monitored Collections (<span x-text="debeziumDetail.collections?.length || 0"></span>)</h3>
+                <div style="display:flex; flex-wrap:wrap; gap:6px;">
+                    <template x-for="col in (debeziumDetail.collections || [])">
+                        <span style="background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:3px 8px; font-size:11px; font-family:monospace;" x-text="col"></span>
+                    </template>
+                </div>
+            </div>
+
+            <!-- Kafka Topics -->
+            <div class="section">
+                <h3>Kafka Topics (<span x-text="debeziumDetail.topics?.length || 0"></span>)</h3>
+                <div style="display:flex; flex-wrap:wrap; gap:6px;">
+                    <template x-for="topic in (debeziumDetail.topics || [])">
+                        <span style="background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:3px 8px; font-size:11px; font-family:monospace;" x-text="topic"></span>
+                    </template>
+                </div>
+            </div>
+
+            <!-- Tasks Detail -->
+            <div class="section">
+                <h3>Connector Tasks</h3>
+                <template x-for="t in (debeziumDetail.tasks || [])">
+                    <div style="display:flex; gap:12px; align-items:center; padding:6px 0; font-size:12px;">
+                        <span class="status-badge" :class="t.state === 'RUNNING' ? 'healthy' : 'critical'" x-text="'Task ' + t.id + ': ' + t.state"></span>
+                        <span style="color:var(--text-dim);" x-text="'Worker: ' + (t.worker || '?')"></span>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <!-- Dragonfly Tab -->
+        <div x-show="tab === 'dragonfly'" class="tab-content">
+            <h2>Dragonfly (Redis)</h2>
+            <div class="cards">
+                <div class="card" :class="dragonflyData.status">
+                    <h3>Status</h3>
+                    <div class="status-badge" :class="dragonflyData.status" x-text="dragonflyData.status"></div>
+                </div>
+                <div class="card" :class="dragonflyData.memory_percent > 90 ? 'critical' : dragonflyData.memory_percent > 75 ? 'warning' : ''">
+                    <h3>Memory</h3>
+                    <div class="big-number" x-text="(dragonflyData.memory_percent || 0) + '%'"></div>
+                    <span x-text="dragonflyData.memory_used || ''"></span>
+                </div>
+                <div class="card">
+                    <h3>Clients</h3>
+                    <div class="big-number" x-text="dragonflyData.connected_clients || 0"></div>
+                    <span x-show="dragonflyData.blocked_clients > 0" class="error" x-text="dragonflyData.blocked_clients + ' blocked'"></span>
+                </div>
+                <div class="card">
+                    <h3>Hit Rate</h3>
+                    <div class="big-number" x-text="(dragonflyData.hit_rate || 0) + '%'"></div>
+                </div>
+            </div>
+            <div class="section" x-show="dragonflyBlocks.length > 0">
+                <h3>Blocked Businesses (Rate Limit)</h3>
+                <table>
+                    <thead><tr><th>Business ID</th><th>TTL (seconds)</th><th>Action</th></tr></thead>
+                    <tbody>
+                        <template x-for="b in dragonflyBlocks">
+                            <tr>
+                                <td x-text="b.business_id"></td>
+                                <td x-text="b.ttl_seconds"></td>
+                                <td><button class="btn btn-sm" @click="unblockBusiness(b.business_id)">Unblock</button></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+            <div class="section" x-show="dragonflyLocks.length > 0">
+                <h3>Active Sync Locks</h3>
+                <table>
+                    <thead><tr><th>Key</th><th>TTL (seconds)</th></tr></thead>
+                    <tbody>
+                        <template x-for="l in dragonflyLocks">
+                            <tr :class="l.ttl_seconds < 0 ? 'warning-row' : ''">
+                                <td x-text="l.key" style="font-family: monospace; font-size: 12px;"></td>
+                                <td x-text="l.ttl_seconds"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Certificates Tab -->
+        <div x-show="tab === 'certs'" class="tab-content">
+            <h2>TLS Certificates</h2>
+            <div class="section">
+                <template x-for="cert in certificates">
+                    <div class="service-card" :class="cert.expired ? 'critical' : cert.expiring_soon ? 'degraded' : 'healthy'">
+                        <h4 x-text="cert.name"></h4>
+                        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:4px;">
+                            <span x-show="cert.domain" class="ns" x-text="cert.domain"></span>
+                            <span x-show="cert.namespace" class="ns" x-text="'ns: ' + cert.namespace"></span>
+                            <span x-show="cert.type" class="ns" x-text="cert.type"></span>
+                        </div>
+                        <div class="stat-row" style="margin:8px 0;">
+                            <span class="status-badge"
+                                  :class="cert.expired ? 'critical' : cert.expiring_soon ? 'degraded' : 'healthy'"
+                                  x-text="cert.expired ? 'EXPIRED' : cert.expiring_soon ? 'EXPIRING SOON' : 'Valid'"></span>
+                            <span x-show="cert.days_remaining != null"
+                                  :style="'font-weight:600; color:' + (cert.days_remaining < 7 ? 'var(--critical)' : cert.days_remaining < 14 ? 'var(--degraded)' : 'var(--healthy)')"
+                                  x-text="cert.days_remaining + ' days remaining'"></span>
+                        </div>
+                        <div x-show="cert.not_after" class="response-time" x-text="'Expires: ' + cert.not_after"></div>
+                        <div x-show="cert.not_before" style="font-size:11px; color:var(--text-dim);" x-text="'Issued: ' + cert.not_before"></div>
+                        <div x-show="cert.ready === false" class="error">Certificate not ready</div>
+                        <div x-show="cert.error" class="error" x-text="cert.error"></div>
+                        <button x-show="cert.expiring_soon || cert.expired" class="btn btn-sm" @click="renewCert(cert.name)">Trigger Renewal</button>
+                    </div>
+                </template>
+                <div x-show="certificates.length === 0" class="empty">No certificates found. Click the tab again to refresh.</div>
+            </div>
+        </div>
+
+        <!-- Nodes Tab -->
+        <div x-show="tab === 'nodes'" class="tab-content">
+            <h2>Cluster Nodes</h2>
+            <div class="section">
+                <h3>Node Resources</h3>
+                <table>
+                    <thead><tr><th>Node</th><th>CPU Used</th><th>CPU Capacity</th><th>CPU %</th><th>Mem Used</th><th>Mem Capacity</th><th>Mem %</th></tr></thead>
+                    <tbody>
+                        <template x-for="n in nodeMetrics">
+                            <tr :class="n.cpu_percent > 90 || n.memory_percent > 90 ? 'warning-row' : ''">
+                                <td x-text="n.name"></td>
+                                <td x-text="n.cpu_used_millicores + 'm'"></td>
+                                <td x-text="n.cpu_capacity_millicores + 'm'"></td>
+                                <td><span :class="n.cpu_percent > 90 ? 'stat critical' : n.cpu_percent > 70 ? 'stat degraded' : ''" x-text="n.cpu_percent + '%'"></span></td>
+                                <td x-text="Math.round(n.memory_used_mib) + 'Mi'"></td>
+                                <td x-text="Math.round(n.memory_capacity_mib) + 'Mi'"></td>
+                                <td><span :class="n.memory_percent > 90 ? 'stat critical' : n.memory_percent > 70 ? 'stat degraded' : ''" x-text="n.memory_percent + '%'"></span></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+            <div class="section">
+                <h3>Top Pods by CPU</h3>
+                <select x-model="podMetricsNs" @change="loadPodMetrics()">
+                    <option value="default">default</option>
+                    <option value="pos">pos</option>
+                </select>
+                <table>
+                    <thead><tr><th>Pod</th><th>CPU (millicores)</th><th>Memory (MiB)</th></tr></thead>
+                    <tbody>
+                        <template x-for="p in podMetrics">
+                            <tr>
+                                <td x-text="p.name" style="font-size: 12px;"></td>
+                                <td x-text="p.cpu_millicores"></td>
+                                <td x-text="p.memory_mib"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Issues Tab (Production Issue Finder) -->
+        <div x-show="tab === 'issues'" class="tab-content">
+            <h2>Production Issues (default + pos)</h2>
+            <div class="log-controls">
+                <button class="btn" @click="scanIssues()" :disabled="scanningIssues">
+                    <span x-text="scanningIssues ? 'Scanning...' : 'Scan Now'"></span>
+                </button>
+                <button class="btn" @click="analyzeAndFix(true)" :disabled="fixingIssues">AI Analyze (Dry Run)</button>
+                <button class="btn btn-danger" @click="analyzeAndFix(false)" :disabled="fixingIssues">AI Auto-Fix</button>
+            </div>
+            <div x-show="issueResult" class="section">
+                <div class="alert info">
+                    Found <strong x-text="issueResult?.total_issues || 0"></strong> issues
+                    (<span class="stat critical" x-text="issueResult?.critical || 0"></span> critical,
+                    <span class="stat degraded" x-text="issueResult?.warning || 0"></span> warnings)
+                    <span x-show="issueResult?.timestamp" style="float:right; font-size:11px; color:var(--text-dim);"
+                          x-text="issueResult?.timestamp ? ('Scanned: ' + new Date(issueResult.timestamp).toLocaleString()) : ''"></span>
+                </div>
+                <template x-for="issue in (issueResult?.issues || [])">
+                    <div class="pattern-match" :class="issue.severity" style="padding:10px; margin-bottom:8px;">
+                        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:4px;">
+                            <span class="badge" :class="issue.severity" x-text="issue.severity"></span>
+                            <span class="category" x-text="issue.type" style="font-weight:600;"></span>
+                            <span style="font-family:monospace; font-size:12px; background:rgba(255,255,255,0.1); padding:2px 6px; border-radius:3px;"
+                                  x-text="issue.namespace + '/' + issue.resource"></span>
+                        </div>
+                        <div class="matched-line" x-text="issue.detail" style="margin-top:4px;"></div>
+                    </div>
+                </template>
+            </div>
+            <div x-show="aiFixResult" class="section">
+                <h3>AI Analysis & Fix</h3>
+                <div style="display:flex; gap:16px; margin-bottom:8px; font-size:12px; color:var(--text-dim);">
+                    <span x-text="'Issues analyzed: ' + (aiFixResult?.issues_count || 0)"></span>
+                    <span x-show="aiFixResult?.duration_ms" x-text="'Duration: ' + (aiFixResult?.duration_ms / 1000).toFixed(1) + 's'"></span>
+                    <span x-text="aiFixResult?.dry_run ? 'Mode: Dry Run' : 'Mode: LIVE'"></span>
+                </div>
+                <div x-show="aiFixResult?.ai_error" class="alert critical" x-text="'AI Error: ' + aiFixResult?.ai_error"></div>
+                <div x-show="aiFixResult?.ai_analysis" class="ai-result"
+                     style="max-height:500px; overflow-y:auto; background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:12px;">
+                    <pre x-html="formatAiAnalysis(aiFixResult?.ai_analysis || '')"
+                         style="white-space:pre-wrap; word-wrap:break-word; font-size:12px; line-height:1.5; margin:0;"></pre>
+                </div>
+                <div x-show="aiFixResult?.executed_fixes?.length > 0" style="margin-top:12px;">
+                    <h4>Executed Fixes:</h4>
+                    <template x-for="fix in (aiFixResult?.executed_fixes || [])">
+                        <div class="action-result completed" style="padding:8px; margin-bottom:4px;">
+                            <code style="background:rgba(0,0,0,0.3); padding:2px 6px; border-radius:3px;" x-text="fix.command"></code>
+                            <span style="margin-left:8px;" x-text="fix.result"></span>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </div>
+
+        <!-- OpenObserve Tab -->
+        <div x-show="tab === 'o2'" class="tab-content">
+            <h2>OpenObserve (open-monitor.oneshell.in)</h2>
+            <div class="cards">
+                <div class="card" :class="o2Status.healthy ? 'healthy' : 'critical'">
+                    <h3>Status</h3>
+                    <div class="status-badge" :class="o2Status.healthy ? 'healthy' : 'critical'"
+                         x-text="o2Status.healthy ? 'Connected' : 'Disconnected'"></div>
+                </div>
+                <div class="card" :class="o2Status.recent_error_count > 10 ? 'warning' : ''">
+                    <h3>Recent Errors (15m)</h3>
+                    <div class="big-number" x-text="o2Status.recent_error_count || 0"></div>
+                </div>
+            </div>
+            <div class="section">
+                <h3>Service Errors</h3>
+                <div class="log-controls">
+                    <select x-model="o2Service">
+                        <option value="PosServerBackend">PosServerBackend</option>
+                        <option value="PosClientBackend">PosClientBackend</option>
+                        <option value="MongoDbService">MongoDbService</option>
+                        <option value="PosService">PosService</option>
+                        <option value="BusinessService">BusinessService</option>
+                        <option value="PosDataSyncService">PosDataSyncService</option>
+                        <option value="mongoEventListner">mongoEventListner</option>
+                    </select>
+                    <select x-model="o2Minutes">
+                        <option value="15">Last 15 min</option>
+                        <option value="60">Last 1 hour</option>
+                        <option value="360">Last 6 hours</option>
+                        <option value="1440">Last 24 hours</option>
+                    </select>
+                    <button class="btn" @click="loadO2Errors()">Fetch Errors</button>
+                    <button class="btn" @click="loadO2Traces()">Slow Traces</button>
+                </div>
+                <div x-show="o2Errors.length > 0">
+                    <template x-for="err in o2Errors.slice(0, 30)">
+                        <div class="pattern-match critical">
+                            <span class="category" x-text="err.service_name || err._stream || ''"></span>
+                            <span x-text="err.body || err.log || err.message || ''"></span>
+                            <div class="matched-line" x-text="err._timestamp ? new Date(err._timestamp / 1000).toLocaleString() : ''"></div>
+                        </div>
+                    </template>
+                </div>
+                <div x-show="o2Errors.length === 0 && !o2Loading" class="empty">No errors found</div>
+            </div>
+            <div x-show="o2Traces.length > 0" class="section">
+                <h3>Slow Traces (>5s)</h3>
+                <table>
+                    <thead><tr><th>Service</th><th>Operation</th><th>Duration</th><th>Time</th></tr></thead>
+                    <tbody>
+                        <template x-for="t in o2Traces">
+                            <tr>
+                                <td x-text="t.service_name || ''"></td>
+                                <td x-text="t.operation_name || t.span_name || ''"></td>
+                                <td x-text="t.duration ? (t.duration / 1000000).toFixed(0) + 'ms' : ''"></td>
+                                <td x-text="t._timestamp ? new Date(t._timestamp / 1000).toLocaleString() : ''"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Log Analysis Tab -->
+        <div x-show="tab === 'logs'" class="tab-content">
+            <h2>Log Analysis</h2>
+            <div class="log-controls">
+                <select x-model="logService">
+                    <option value="posserverbackend">PosServerBackend</option>
+                    <option value="posclientbackend">PosClientBackend</option>
+                    <option value="mongodbservice">MongoDbService</option>
+                    <option value="gatewayservice">GatewayService</option>
+                    <option value="posservice">PosService</option>
+                    <option value="scheduler">Scheduler</option>
+                    <option value="quartzscheduler">QuartzScheduler</option>
+                </select>
+                <label><input type="checkbox" x-model="useAI"> Use AI Analysis</label>
+                <button class="btn" @click="analyzeLogs()" :disabled="analyzing">
+                    <span x-text="analyzing ? 'Analyzing...' : 'Analyze Logs'"></span>
+                </button>
+            </div>
+            <div x-show="logResult" class="section">
+                <div style="display:flex; align-items:center; gap:16px; margin-bottom:12px; flex-wrap:wrap;">
+                    <h3 style="margin:0;">Results for <span style="color:var(--info);" x-text="logResult?.service || logService"></span></h3>
+                    <span x-show="logResult?.analyzed_at" style="font-size:11px; color:var(--text-dim);"
+                          x-text="logResult?.analyzed_at ? ('Analyzed: ' + new Date(logResult.analyzed_at).toLocaleString()) : ''"></span>
+                    <span x-show="logResult?.duration_ms" style="font-size:11px; color:var(--text-dim);"
+                          x-text="'(' + (logResult?.duration_ms ? (logResult.duration_ms / 1000).toFixed(1) : '?') + 's)'"></span>
+                    <span x-show="logResult?.total_lines" style="font-size:11px; color:var(--text-dim);"
+                          x-text="(logResult?.total_lines || 0) + ' lines analyzed'"></span>
+                </div>
+                <div x-show="logResult?.summary" class="alert info" x-text="logResult?.summary"></div>
+                <div x-show="logResult?.root_cause" class="alert warning">
+                    <strong>Root Cause:</strong> <span x-text="logResult?.root_cause"></span>
+                </div>
+                <div x-show="logResult?.recommended_actions?.length > 0" class="alert info" style="margin-top:8px;">
+                    <strong>Recommended Actions:</strong>
+                    <ul style="margin:4px 0 0 16px; padding:0;">
+                        <template x-for="action in (logResult?.recommended_actions || [])">
+                            <li x-text="action"></li>
+                        </template>
+                    </ul>
+                </div>
+                <div x-show="logResult?.ai_analysis" class="ai-result"
+                     style="max-height:400px; overflow-y:auto; background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:12px; margin-top:8px;">
+                    <h4 style="margin:0 0 8px 0;">AI Analysis</h4>
+                    <pre x-text="logResult?.ai_analysis" style="white-space:pre-wrap; word-wrap:break-word; font-size:12px; line-height:1.5; margin:0;"></pre>
+                </div>
+                <div x-show="logResult?.matches?.length > 0" style="margin-top:12px;">
+                    <h4 style="margin-bottom:8px;">Pattern Matches (<span x-text="logResult?.matches?.length || 0"></span>)</h4>
+                </div>
+                <template x-for="m in (logResult?.matches || [])">
+                    <div class="pattern-match" :class="m.severity" style="padding:10px; margin-bottom:6px;">
+                        <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+                            <span class="badge" :class="m.severity" x-text="m.severity"></span>
+                            <span class="category" style="font-weight:600;" x-text="m.category"></span>
+                            <span x-show="m.service" style="font-size:11px; color:var(--text-dim);" x-text="'[' + m.service + ']'"></span>
+                        </div>
+                        <div x-text="m.description" style="margin-bottom:4px;"></div>
+                        <div class="matched-line" x-text="m.matched_line" style="font-family:monospace; font-size:11px; background:rgba(0,0,0,0.2); padding:4px 8px; border-radius:3px;"></div>
+                        <div x-show="m.recommendation" class="recommendation" style="margin-top:4px; font-size:12px; color:var(--info);" x-text="m.recommendation"></div>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <!-- Issues Tab (dedicated analysis page) -->
+        <div x-show="tab === 'issues'" class="tab-content">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+                <h2 style="margin:0;">Infrastructure Issues</h2>
+                <button class="btn" @click="scanIssuesPage()" :disabled="issuesPageScanning">
+                    <span x-text="issuesPageScanning ? 'Scanning...' : 'Scan All Systems'"></span>
+                </button>
+            </div>
+
+            <div x-show="issuesPageResult">
+                <div class="cards" style="margin-bottom:16px;">
+                    <div class="card" :class="issuesPageResult?.critical > 0 ? 'critical' : 'healthy'">
+                        <h3>Critical</h3>
+                        <div class="big-number" x-text="issuesPageResult?.critical || 0"></div>
+                    </div>
+                    <div class="card" :class="issuesPageResult?.warning > 0 ? 'warning' : ''">
+                        <h3>Warnings</h3>
+                        <div class="big-number" x-text="issuesPageResult?.warning || 0"></div>
+                    </div>
+                    <div class="card">
+                        <h3>Total</h3>
+                        <div class="big-number" x-text="issuesPageResult?.total || 0"></div>
+                    </div>
+                    <div class="card">
+                        <h3>Scanned</h3>
+                        <div style="font-size:11px; color:var(--text-dim);" x-text="issuesPageResult?.timestamp ? new Date(issuesPageResult.timestamp).toLocaleString() : ''"></div>
+                    </div>
+                </div>
+
+                <template x-for="(issue, idx) in (issuesPageResult?.issues || [])">
+                    <div style="margin-bottom:8px; border:1px solid var(--border); border-radius:8px; overflow:hidden;"
+                         :style="'border-left:3px solid ' + (issue.severity === 'critical' ? 'var(--critical)' : 'var(--degraded)')">
+                        <div style="display:flex; justify-content:space-between; align-items:center; padding:10px 12px; gap:8px;">
+                            <div style="display:flex; gap:6px; align-items:center; flex:1; min-width:0;">
+                                <span class="badge" :class="issue.severity" x-text="issue.severity" style="flex-shrink:0;"></span>
+                                <span style="color:var(--info); font-weight:600; font-size:11px; flex-shrink:0;" x-text="issue.source"></span>
+                                <span style="font-size:11px; color:var(--text-dim); flex-shrink:0;" x-text="issue.service"></span>
+                                <span style="font-size:12px;" x-text="issue.detail"></span>
+                            </div>
+                            <div style="display:flex; gap:4px; flex-shrink:0;">
+                                <button class="btn btn-sm" @click="diagnoseIssue(issue)" :disabled="issue._fixing" x-show="!issue._fixResult">
+                                    <span x-text="issue._fixing ? 'Analyzing...' : 'Diagnose'"></span>
+                                </button>
+                                <button x-show="issue._fixResult?.status === 'plan_ready'" class="btn btn-sm" style="background:var(--healthy);"
+                                        @click="executePlan(issue, false)" :disabled="issue._executing">Approve &amp; Execute</button>
+                                <button x-show="issue._fixResult?.status === 'plan_ready'" class="btn btn-sm" style="background:var(--accent);"
+                                        @click="executePlan(issue, true)" :disabled="issue._executing">AI Agent Fix</button>
+                                <button x-show="issue._fixResult?.deploy_command" class="btn btn-sm" style="background:var(--info);"
+                                        @click="deployService(issue)">Deploy</button>
+                                <button x-show="issue._fixResult" class="btn btn-sm" @click="diagnoseIssue(issue)" :disabled="issue._fixing">Retry</button>
+                            </div>
+                        </div>
+
+                        <!-- Expanded fix details -->
+                        <div x-show="issue._fixProgress?.length > 0 || issue._fixResult" style="padding:0 12px 10px 12px; border-top:1px solid var(--border);">
+                            <template x-for="msg in (issue._fixProgress || [])">
+                                <div style="display:flex; gap:6px; align-items:center; padding:3px 0; font-size:11px;">
+                                    <span :style="'color:' + (msg.includes('done') || msg.includes('complete') || msg.includes('succeeded') ? 'var(--healthy)' : msg.includes('ERROR') || msg.includes('FAILED') ? 'var(--critical)' : 'var(--degraded)')">&#9679;</span>
+                                    <span style="color:var(--text-dim);" x-text="msg"></span>
+                                </div>
+                            </template>
+                            <div x-show="issue._fixResult?.diagnosis" class="alert info" style="margin:8px 0 6px 0; padding:6px 10px; font-size:12px;">
+                                <strong>Diagnosis:</strong> <span x-text="issue._fixResult?.diagnosis"></span>
+                            </div>
+                            <template x-for="(step, si) in (issue._fixResult?.steps || [])">
+                                <div style="padding:6px 8px; margin:4px 0; border-radius:4px; font-size:11px; border-left:2px solid;"
+                                     :style="'border-color:' + (step.risk === 'high' ? 'var(--critical)' : step.risk === 'medium' ? 'var(--degraded)' : 'var(--healthy)')">
+                                    <div style="display:flex; gap:4px; align-items:center; justify-content:space-between;">
+                                        <div style="display:flex; gap:4px; align-items:center;">
+                                            <span x-show="issue._fixResult?.executed_steps?.[si]?.success === true" style="color:var(--healthy);">&#10003;</span>
+                                            <span x-show="issue._fixResult?.executed_steps?.[si]?.success === false" style="color:var(--critical);">&#10007;</span>
+                                            <span class="badge" :class="step.risk === 'high' ? 'critical' : step.risk === 'medium' ? 'warning' : 'info'" x-text="'Step ' + (si+1)" style="font-size:10px;"></span>
+                                            <span x-text="step.description"></span>
+                                        </div>
+                                        <button x-show="step.command && !issue._fixResult?.executed_steps?.[si]" class="btn btn-sm" style="font-size:10px; padding:2px 8px;" @click="runStep(issue, si, step.command)">Run</button>
+                                    </div>
+                                    <code style="display:block; font-size:10px; color:var(--text-dim); margin-top:3px; word-break:break-all;" x-text="step.command"></code>
+                                    <pre x-show="issue._fixResult?.executed_steps?.[si]?.output" style="font-size:10px; margin-top:3px; padding:4px; background:var(--bg); border-radius:3px; white-space:pre-wrap; max-height:100px; overflow-y:auto;"
+                                         :style="'color:' + (issue._fixResult?.executed_steps?.[si]?.success ? 'var(--healthy)' : 'var(--critical)')"
+                                         x-text="issue._fixResult?.executed_steps?.[si]?.output"></pre>
+                                </div>
+                            </template>
+                            <div x-show="issue._agentLog?.length > 0" style="margin-top:8px;">
+                                <h4 style="font-size:12px; color:var(--accent); margin-bottom:4px;">AI Agent Activity:</h4>
+                                <div style="background:var(--bg); border-radius:4px; padding:8px; max-height:300px; overflow-y:auto; font-family:monospace; font-size:10px; line-height:1.6;">
+                                    <template x-for="log in (issue._agentLog || [])">
+                                        <div :style="'color:' + (log.type === 'tool_call' ? 'var(--degraded)' : log.type === 'result' ? 'var(--healthy)' : 'var(--text-dim)')">
+                                            <span style="color:var(--info);" x-text="'[' + log.type + ']'"></span> <span x-text="log.text"></span>
+                                        </div>
+                                    </template>
+                                </div>
+                            </div>
+                            <div style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border);">
+                                <div style="display:flex; gap:4px; align-items:center;">
+                                    <input type="text" x-model="issue._manualCmd" :placeholder="'Run a command...'" style="flex:1; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px 8px; font-family:monospace; font-size:11px;" @keydown.enter="runManualCmd(issue)">
+                                    <button class="btn btn-sm" @click="runManualCmd(issue)" :disabled="!issue._manualCmd?.trim()">Run</button>
+                                </div>
+                                <pre x-show="issue._manualOutput" style="font-size:10px; margin-top:4px; padding:6px; background:var(--bg); border-radius:4px; white-space:pre-wrap; max-height:120px; overflow-y:auto; color:var(--text);" x-text="issue._manualOutput"></pre>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+
+                <div x-show="issuesPageResult?.total === 0" class="empty" style="padding:30px; color:var(--healthy);">All systems healthy - no issues detected</div>
+            </div>
+            <div x-show="!issuesPageResult" class="empty">Click "Scan All Systems" to detect issues</div>
+        </div>
+
+        <!-- Incidents Tab -->
+        <div x-show="tab === 'incidents'" class="tab-content">
+            <h2>Incidents</h2>
+            <div class="section">
+                <template x-for="inc in incidents">
+                    <div class="incident-card" :class="inc.severity">
+                        <div class="incident-header">
+                            <span class="badge" x-text="inc.severity"></span>
+                            <span class="badge" :class="inc.status" x-text="inc.status"></span>
+                            <strong x-text="inc.title"></strong>
+                            <span class="incident-id" x-text="'#' + inc.id"></span>
+                        </div>
+                        <div x-text="inc.description"></div>
+                        <div class="incident-meta">
+                            Services: <span x-text="inc.affected_services?.join(', ') || 'N/A'"></span>
+                            | Detected: <span x-text="new Date(inc.detected_at).toLocaleString()"></span>
+                        </div>
+                        <div x-show="inc.status !== 'resolved'" class="incident-actions">
+                            <button class="btn btn-sm" @click="resolveIncident(inc.id)">Resolve</button>
+                            <button class="btn btn-sm" @click="generatePostmortem(inc.id)">Post-mortem</button>
+                        </div>
+                    </div>
+                </template>
+                <div x-show="incidents.length === 0" class="empty">No incidents</div>
+            </div>
+        </div>
+
+        <!-- Remediation Tab -->
+        <div x-show="tab === 'remediation'" class="tab-content">
+            <h2>Remediation Playbooks</h2>
+            <div class="alert info" style="margin-bottom:16px; line-height:1.6;">
+                Playbooks are pre-defined automated response procedures for common production issues.
+                Each playbook has a trigger condition, a sequence of actions, and a risk level.
+                Use <strong>Dry Run</strong> to preview actions safely, or <strong>Execute</strong> to run them
+                (requires confirmation for risky actions).
+            </div>
+            <div class="section">
+                <template x-for="pb in playbooks">
+                    <div class="playbook-card" style="padding:14px; margin-bottom:12px;">
+                        <h4 x-text="pb.name" style="margin:0 0 4px 0;"></h4>
+                        <p x-text="pb.description" style="margin:0 0 8px 0; color:var(--text-dim);"></p>
+                        <div x-show="pb.trigger_pattern" style="margin-bottom:8px; font-size:12px;">
+                            <span style="color:var(--text-dim);">Triggers on:</span>
+                            <code style="background:rgba(255,255,255,0.08); padding:2px 6px; border-radius:3px; font-size:11px;"
+                                  x-text="pb.trigger_pattern"></code>
+                        </div>
+                        <div class="playbook-meta" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:8px; font-size:13px;">
+                            <span>Severity: <span class="badge" :class="pb.severity" x-text="pb.severity"></span></span>
+                            <span>Actions: <strong x-text="pb.actions?.length || 0"></strong></span>
+                            <span>Approval: <strong x-text="pb.requires_approval ? 'Required' : 'Auto'"></strong></span>
+                            <span x-show="pb.cooldown_minutes">Cooldown: <strong x-text="pb.cooldown_minutes + 'min'"></strong></span>
+                        </div>
+                        <div x-show="pb.actions?.length > 0" style="margin-bottom:8px;">
+                            <div style="font-size:11px; color:var(--text-dim); margin-bottom:4px;">Action steps:</div>
+                            <template x-for="(action, idx) in (pb.actions || [])">
+                                <div style="font-size:12px; padding:2px 0; display:flex; gap:6px;">
+                                    <span style="color:var(--text-dim); min-width:16px;" x-text="(idx+1) + '.'"></span>
+                                    <span x-text="action.description || action.name"></span>
+                                    <span class="badge" style="font-size:10px; padding:1px 5px;"
+                                          :class="action.risk_level === 'high' ? 'critical' : action.risk_level === 'medium' ? 'degraded' : 'healthy'"
+                                          x-text="action.risk_level || 'low'"></span>
+                                </div>
+                            </template>
+                        </div>
+                        <div class="playbook-actions" style="display:flex; gap:8px;">
+                            <button class="btn btn-sm" @click="executePlaybook(pb.name, true)">Dry Run</button>
+                            <button class="btn btn-sm btn-danger" @click="executePlaybook(pb.name, false)">Execute</button>
+                        </div>
+                        <div x-show="playbookResults[pb.name]" class="playbook-result" style="margin-top:8px;">
+                            <template x-for="r in (playbookResults[pb.name] || [])">
+                                <div class="action-result" :class="r.status" style="padding:6px; margin-bottom:4px;">
+                                    <strong x-text="r.name"></strong>: <span x-text="r.result || r.error"></span>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </div>
+    </main>
+
+    <script src="/static/js/websocket.js"></script>
+    <script src="/static/js/charts.js"></script>
+    <script src="/static/js/topology.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

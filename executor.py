@@ -8,6 +8,7 @@ from task_queue import TaskQueue, TaskStatus
 from context_manager import ContextManager
 from tools import describe_tool_call
 from agents import SDK_AVAILABLE, SUBAGENTS
+import progress_broadcaster as broadcaster
 
 logger = logging.getLogger("clawdbot.executor")
 
@@ -100,6 +101,9 @@ class Executor:
         )
         from claude_agent_sdk.types import ToolUseBlock
 
+        # Prevent "nested session" error when running inside Claude Code
+        os.environ.pop("CLAUDECODE", None)
+
         working_dir = self.ctx_mgr.get_working_dir(task.context)
         session_id = self.ctx_mgr.get_session_id(task.chat_id, task.context)
 
@@ -166,16 +170,29 @@ class Executor:
                                     current_agent = agent_type
                                     agents_invoked.append(agent_type)
                                     last_activity = f"  > {agent_type}: {desc}"
+                                    asyncio.ensure_future(broadcaster.emit(
+                                        "agent_invoked", task_id=task.id,
+                                        agent=agent_type, description=desc,
+                                    ))
                             else:
                                 desc = describe_tool_call(block.name, block.input)
                                 prefix = f"{current_agent}: " if current_agent else ""
                                 last_activity = f"  > {prefix}{desc}"
+                                asyncio.ensure_future(broadcaster.emit(
+                                    "tool_call", task_id=task.id,
+                                    tool=block.name, description=desc,
+                                ))
                             await self._update_status(task, _build_status())
 
                 elif isinstance(message, ResultMessage):
                     result_text = message.result or ""
                     if not new_session_id:
                         new_session_id = message.session_id
+                    asyncio.ensure_future(broadcaster.emit(
+                        "result", task_id=task.id,
+                        text=result_text[:500] if result_text else "",
+                        tools_count=len(tools_used),
+                    ))
 
             logger.info(f"Task #{task.id} multi-agent done: {msg_count} msgs, {len(tools_used)} tools, agents: {agents_invoked}")
 
@@ -229,6 +246,7 @@ class Executor:
 
         env = os.environ.copy()
         env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("CLAUDECODE", None)
 
         cmd = [
             "claude",
@@ -306,6 +324,10 @@ class Executor:
                         desc = describe_tool_call(name, input_data)
                         tool_log.append(desc)
                         await self._update_status(task, _cli_status())
+                        asyncio.ensure_future(broadcaster.emit(
+                            "tool_call", task_id=task.id,
+                            tool=name, description=desc,
+                        ))
 
             elif event.get("type") == "result":
                 result_text = event.get("result", "")

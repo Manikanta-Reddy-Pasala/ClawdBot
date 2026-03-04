@@ -4,7 +4,7 @@ import threading
 
 from config import config
 
-DEFAULT_CONTEXT = "vm"
+DEFAULT_CONTEXT = config.DEFAULT_CONTEXT_NAME
 
 
 class ContextManager:
@@ -24,10 +24,10 @@ class ContextManager:
 
     def _init_db(self):
         conn = self._get_conn()
-        conn.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS active_context (
                 chat_id INTEGER PRIMARY KEY,
-                context TEXT NOT NULL DEFAULT 'vm'
+                context TEXT NOT NULL DEFAULT '{DEFAULT_CONTEXT}'
             )
         """)
         conn.execute("""
@@ -105,6 +105,8 @@ class ContextManager:
         # Add auto-discovered repos
         if os.path.isdir(self._repos_dir):
             for name in sorted(os.listdir(self._repos_dir)):
+                if name.startswith(".") or name.startswith("_"):
+                    continue
                 full = os.path.join(self._repos_dir, name)
                 if os.path.isdir(full):
                     contexts.append(name)
@@ -134,7 +136,7 @@ class ContextManager:
 
     def get_working_dir(self, context: str) -> str:
         if context == DEFAULT_CONTEXT:
-            return "/opt/clawdbot"
+            return config.DEFAULT_WORKING_DIR
         # Check custom contexts first
         custom = self.get_custom_contexts()
         if context in custom:
@@ -143,7 +145,7 @@ class ContextManager:
         repo_path = os.path.join(self._repos_dir, context)
         if os.path.isdir(repo_path):
             return repo_path
-        return "/opt/clawdbot"
+        return config.DEFAULT_WORKING_DIR
 
     def add_message(self, chat_id: int, context: str, role: str, content: str):
         conn = self._get_conn()
