@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse
 
 import progress_broadcaster as broadcaster
+from shell_executor import execute_shell, is_command_safe
 from devops.monitors import (
     kubernetes_monitor, service_health_monitor, mongodb_monitor,
     nats_monitor, log_analyzer_monitor, issue_finder,
@@ -346,17 +347,78 @@ async def autodetect_issues():
 
 @app.post("/api/v1/issues/fix-one", dependencies=[Depends(verify_api_key)])
 async def fix_one_issue(request: Request):
-    return {"status": "not_implemented", "message": "Use remediation playbooks instead"}
+    data = await request.json()
+    issue_text = data.get("issue", "")
+    service = data.get("service", "")
+    if not issue_text:
+        raise HTTPException(400, "Missing issue text")
+    prompt = (
+        f"You are a Kubernetes DevOps expert. Diagnose this issue and provide fix steps.\n"
+        f"Service: {service}\nIssue: {issue_text}\n\n"
+        f"Return JSON with: diagnosis (string), steps (array of {{description, command, risk}}).\n"
+        f"Commands should use kubectl with --insecure-skip-tls-verify. Only suggest safe, read-first commands."
+    )
+    result = await _run_claude(prompt, timeout=60)
+    return _parse_ai_response(result)
 
 
 @app.post("/api/v1/issues/execute-plan", dependencies=[Depends(verify_api_key)])
 async def execute_plan(request: Request):
-    return {"status": "not_implemented", "message": "Use remediation playbooks instead"}
+    data = await request.json()
+    steps = data.get("steps", [])
+    use_agent = data.get("use_agent", False)
+    issue_text = data.get("issue", "")
+    service = data.get("service", "")
+
+    if use_agent:
+        prompt = (
+            f"You are a Kubernetes DevOps expert with kubectl access. "
+            f"Investigate and fix this issue autonomously.\n"
+            f"Service: {service}\nIssue: {issue_text}\n\n"
+            f"Use kubectl with --insecure-skip-tls-verify. "
+            f"First investigate (logs, events, describe), then apply safe fixes. "
+            f"Report what you found and what you did."
+        )
+        start = time.time()
+        result = await _run_claude(prompt, timeout=120)
+        agent_log = [{"type": "result", "text": result}]
+        return {
+            "status": "done",
+            "agent_log": agent_log,
+            "final_output": result,
+            "duration_ms": int((time.time() - start) * 1000),
+            "executed_steps": [],
+        }
+
+    # Execute approved steps
+    executed = []
+    for step in steps:
+        cmd = step.get("command", "")
+        if not cmd:
+            executed.append({"command": cmd, "success": False, "output": "Empty command"})
+            continue
+        safe, reason = is_command_safe(cmd)
+        if not safe:
+            executed.append({"command": cmd, "success": False, "output": f"Blocked: {reason}"})
+            continue
+        output = await execute_shell(cmd, timeout=30)
+        success = "[exit code: 0]" in output
+        executed.append({"command": cmd, "success": success, "output": output})
+    return {"status": "done", "executed_steps": executed}
 
 
 @app.post("/api/v1/issues/run-step", dependencies=[Depends(verify_api_key)])
 async def run_step(request: Request):
-    return {"status": "not_implemented", "message": "Use remediation playbooks instead"}
+    data = await request.json()
+    command = data.get("command", "")
+    if not command:
+        raise HTTPException(400, "Missing command")
+    safe, reason = is_command_safe(command)
+    if not safe:
+        return {"success": False, "output": f"Blocked: {reason}"}
+    output = await execute_shell(command, timeout=30)
+    success = "[exit code: 0]" in output
+    return {"success": success, "output": output}
 
 
 @app.post("/api/v1/issues/deploy", dependencies=[Depends(verify_api_key)])
@@ -372,7 +434,101 @@ async def analyze_and_fix(dry_run: bool = True):
 
 @app.post("/api/v1/analysis/ai-fix", dependencies=[Depends(verify_api_key)])
 async def ai_fix(request: Request):
-    return {"status": "not_implemented", "message": "Use ClawdBot Telegram for AI analysis"}
+    data = await request.json()
+    error_text = data.get("error_text", "")
+    service = data.get("service", "")
+    auto_execute = data.get("auto_execute", False)
+    if not error_text:
+        raise HTTPException(400, "Missing error_text")
+
+    prompt = (
+        f"You are a Kubernetes DevOps expert for OneShell POS (microservices on K8s).\n"
+        f"{'Service: ' + service + chr(10) if service else ''}"
+        f"Error: {error_text}\n\n"
+        f"Diagnose the root cause and provide actionable fix steps.\n"
+        f"Return JSON: {{\"diagnosis\": \"...\", \"steps\": [{{\"description\": \"...\", \"command\": \"kubectl ...\", \"risk\": \"low|medium|high\"}}]}}\n"
+        f"Use --insecure-skip-tls-verify with all kubectl commands. "
+        f"Namespaces: default (most services), pos (PosClientBackend, PosPythonBackend, NATS), mongodb (Percona)."
+    )
+    start = time.time()
+    result = await _run_claude(prompt, timeout=90)
+    parsed = _parse_ai_response(result)
+    parsed["duration_ms"] = int((time.time() - start) * 1000)
+
+    if auto_execute and parsed.get("steps"):
+        executed = []
+        for step in parsed["steps"]:
+            cmd = step.get("command", "")
+            risk = step.get("risk", "medium")
+            if risk == "high":
+                executed.append({"command": cmd, "success": False, "output": "Skipped: high-risk, needs approval"})
+                continue
+            if not cmd:
+                continue
+            safe, reason = is_command_safe(cmd)
+            if not safe:
+                executed.append({"command": cmd, "success": False, "output": f"Blocked: {reason}"})
+                continue
+            output = await execute_shell(cmd, timeout=30)
+            success = "[exit code: 0]" in output
+            executed.append({"command": cmd, "success": success, "output": output})
+        parsed["executed_steps"] = executed
+
+    return parsed
+
+
+async def _run_claude(prompt: str, timeout: int = 90) -> str:
+    """Run claude CLI with a prompt and return the text output."""
+    cmd = [
+        "claude", "-p", "--output-format", "text",
+        "--max-turns", "5", "--dangerously-skip-permissions",
+    ]
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("CLAUDECODE", None)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            cwd="/opt/clawdbot",
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=prompt.encode()), timeout=timeout
+        )
+        output = stdout.decode("utf-8", errors="replace").strip()
+        if not output and stderr:
+            output = stderr.decode("utf-8", errors="replace").strip()
+        return output or "(no output)"
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return "(Claude timed out)"
+    except Exception as e:
+        return f"(Error running Claude: {e})"
+
+
+def _parse_ai_response(text: str) -> dict:
+    """Try to parse JSON from Claude response, fallback to text diagnosis."""
+    # Try to extract JSON block
+    import re
+    json_match = re.search(r'\{[\s\S]*"diagnosis"[\s\S]*\}', text)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group())
+            return {
+                "status": "ok",
+                "diagnosis": parsed.get("diagnosis", ""),
+                "steps": parsed.get("steps", []),
+                "raw": text,
+            }
+        except json.JSONDecodeError:
+            pass
+    return {"status": "ok", "diagnosis": text, "steps": [], "raw": text}
 
 
 @app.post("/api/v1/logs/{service}/analyze", dependencies=[Depends(verify_api_key)])
