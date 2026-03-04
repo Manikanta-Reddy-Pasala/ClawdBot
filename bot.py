@@ -562,10 +562,10 @@ async def _start_api_server():
 def main():
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(
-        read_timeout=60,
-        write_timeout=60,
-        connect_timeout=30,
-        pool_timeout=30,
+        read_timeout=None,
+        write_timeout=None,
+        connect_timeout=None,
+        pool_timeout=None,
     )
     app = (
         Application.builder()
