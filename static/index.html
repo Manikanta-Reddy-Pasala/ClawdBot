@@ -89,15 +89,23 @@
                     </div>
                     <div style="font-size:11px; color:var(--text-dim)" x-text="'Uptime: ' + formatUptime(dashMongo.uptime_seconds)"></div>
                 </div>
-                <div class="card" :class="dashNats.status === 'healthy' ? 'healthy' : dashNats.status ? 'critical' : ''">
+                <div class="card" :class="dashNats.dlq_messages > 0 ? 'warning' : dashNats.status === 'healthy' ? 'healthy' : dashNats.status ? 'critical' : ''">
                     <h3>NATS JetStream</h3>
                     <div class="stat-row">
                         <span class="stat" x-text="dashNats.connections ?? '--'"></span> conns
                         <span class="stat" x-text="dashNats.subscriptions ?? '--'"></span> subs
-                        <span class="stat" x-text="(dashNats.streams?.length ?? dashNats.streams ?? 0)"></span> streams
+                        <span class="stat" x-text="(dashNats.streams?.length ?? 0)"></span> streams
                     </div>
                     <div x-show="dashNats.version" style="font-size:11px; color:var(--text-dim)" x-text="'v' + dashNats.version"></div>
-                    <div x-show="dashNats.dlq_messages > 0" class="error" x-text="dashNats.dlq_messages + ' DLQ messages'"></div>
+                    <!-- Warning indicators -->
+                    <div x-show="dashNats.dlq_messages > 0" style="margin-top:4px; padding:3px 6px; background:rgba(255,100,100,0.15); border-radius:4px; font-size:11px; color:var(--critical); font-weight:600;"
+                         x-text="dashNats.dlq_messages + ' DLQ messages (failed)'"></div>
+                    <div x-show="(dashNats.consumers || []).some(c => c.num_pending > 100)" style="margin-top:3px; padding:3px 6px; background:rgba(255,180,50,0.15); border-radius:4px; font-size:11px; color:var(--degraded); font-weight:600;"
+                         x-text="(dashNats.consumers || []).filter(c => c.num_pending > 100).map(c => c.name + ': ' + c.num_pending + ' pending').join(', ')"></div>
+                    <div x-show="(dashNats.consumers || []).some(c => c.num_redelivered > 10)" style="margin-top:3px; padding:3px 6px; background:rgba(255,180,50,0.15); border-radius:4px; font-size:11px; color:var(--degraded);"
+                         x-text="(dashNats.consumers || []).filter(c => c.num_redelivered > 10).map(c => c.name + ': ' + c.num_redelivered + ' redelivered').join(', ')"></div>
+                    <div x-show="(dashNats.streams || []).some(s => s.messages > 1000 && !s.name.includes('dlq'))" style="margin-top:3px; font-size:10px; color:var(--text-dim);"
+                         x-text="(dashNats.streams || []).filter(s => s.messages > 1000).map(s => s.name + ': ' + s.messages + ' msgs').join(' | ')"></div>
                 </div>
                 <div class="card" :class="dashDragonfly.memory_percent > 80 ? 'warning' : 'healthy'">
                     <h3>Dragonfly</h3>
@@ -415,13 +423,22 @@
                     <div class="big-number" x-text="natsHealth.connections ?? '--'"></div>
                     <div style="font-size:11px; color:var(--text-dim)" x-text="(natsHealth.subscriptions || 0) + ' subscriptions'"></div>
                 </div>
-                <div class="card" :class="natsHealth.dlq_messages > 0 ? 'warning' : ''">
+                <div class="card" :class="natsHealth.dlq_messages > 0 ? 'critical' : 'healthy'">
                     <h3>DLQ Messages</h3>
-                    <div class="big-number" :class="natsHealth.dlq_messages > 0 ? 'warning-text' : ''" x-text="natsHealth.dlq_messages ?? 0"></div>
+                    <div class="big-number" :style="natsHealth.dlq_messages > 0 ? 'color:var(--critical)' : 'color:var(--healthy)'" x-text="natsHealth.dlq_messages ?? 0"></div>
                     <div x-show="natsHealth.dlq_messages > 0" style="margin-top:6px;">
                         <button class="btn btn-sm" @click="natsAction('dlq/replay?limit=10', 'Replay 10 DLQ messages?')">Replay 10</button>
                         <button class="btn btn-sm btn-danger" @click="natsAction('dlq/purge', 'PURGE all DLQ messages? This cannot be undone.')">Purge DLQ</button>
                     </div>
+                    <div x-show="natsHealth.dlq_messages === 0" style="font-size:11px; color:var(--healthy);">No failed messages</div>
+                </div>
+                <div class="card" :class="(natsConsumers || []).some(c => c.num_pending > 100) ? 'warning' : ''">
+                    <h3>Consumer Lag</h3>
+                    <div class="big-number" :style="(natsConsumers || []).some(c => c.num_pending > 100) ? 'color:var(--degraded)' : 'color:var(--healthy)'"
+                         x-text="(natsConsumers || []).reduce((sum, c) => sum + (c.num_pending || 0), 0)"></div>
+                    <div style="font-size:11px; color:var(--text-dim);">total pending messages</div>
+                    <div x-show="(natsConsumers || []).some(c => c.num_redelivered > 0)" style="font-size:11px; margin-top:2px; color:var(--degraded);"
+                         x-text="(natsConsumers || []).reduce((sum, c) => sum + (c.num_redelivered || 0), 0) + ' redeliveries'"></div>
                 </div>
                 <div class="card">
                     <h3>Throughput</h3>
@@ -429,7 +446,21 @@
                         In: <strong x-text="natsHealth.in_msgs ?? 0"></strong> msgs
                         Out: <strong x-text="natsHealth.out_msgs ?? 0"></strong> msgs
                     </div>
+                    <div style="font-size:11px; color:var(--text-dim); margin-top:4px;"
+                         x-text="(natsStreams || []).length + ' streams, ' + (natsConsumers || []).length + ' consumers'"></div>
                 </div>
+            </div>
+            <!-- Alert banner when issues detected -->
+            <div x-show="natsHealth.dlq_messages > 0 || (natsConsumers || []).some(c => c.num_pending > 100 || c.num_redelivered > 10)"
+                 class="alert critical" style="margin-bottom:16px;">
+                <strong>Issues Detected:</strong>
+                <span x-show="natsHealth.dlq_messages > 0" x-text="natsHealth.dlq_messages + ' messages in DLQ (permanently failed). '"></span>
+                <template x-for="c in (natsConsumers || []).filter(c => c.num_pending > 100)">
+                    <span x-text="c.name + ' has ' + c.num_pending + ' pending messages (consumer lag). '"></span>
+                </template>
+                <template x-for="c in (natsConsumers || []).filter(c => c.num_redelivered > 10)">
+                    <span x-text="c.name + ' has ' + c.num_redelivered + ' redeliveries (processing failures). '"></span>
+                </template>
             </div>
             <div class="section">
                 <h3>Streams</h3>
