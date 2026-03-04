@@ -13,6 +13,7 @@ import progress_broadcaster as broadcaster
 logger = logging.getLogger("clawdbot.executor")
 
 POLL_INTERVAL = 2  # seconds
+SDK_INACTIVITY_TIMEOUT = 120  # seconds - kill task if no SDK message for this long
 
 
 class Executor:
@@ -140,36 +141,66 @@ class Executor:
             return f"{header}\n{last_activity}"
 
         # Heartbeat: update status every 10s so user knows it's alive
-        heartbeat_running = True
+        heartbeat_stop = asyncio.Event()
 
         async def _heartbeat():
-            while heartbeat_running:
-                await asyncio.sleep(10)
-                if heartbeat_running:
-                    await self._update_status(task, _build_status())
+            while not heartbeat_stop.is_set():
+                try:
+                    await asyncio.wait_for(heartbeat_stop.wait(), timeout=10)
+                    break  # Event was set, stop heartbeat
+                except asyncio.TimeoutError:
+                    pass  # 10s elapsed, update status
+                await self._update_status(task, _build_status())
 
         heartbeat_task = asyncio.create_task(_heartbeat())
 
-        try:
-            msg_count = 0
-            async for message in query(prompt=task.prompt, options=opts):
-                msg_count += 1
+        class InactivityTimeout(Exception):
+            pass
+
+        async def _run_sdk_query(prompt, sdk_opts, inactivity_timeout=0):
+            """Run SDK query. If inactivity_timeout > 0, raise InactivityTimeout
+            when no message arrives within that many seconds."""
+            nonlocal current_agent, last_activity
+            _msg_count = 0
+            _result_text = ""
+            _new_session_id = None
+            _tools = []
+            _agents = []
+
+            aiter = query(prompt=prompt, options=sdk_opts).__aiter__()
+
+            while True:
+                try:
+                    if inactivity_timeout > 0:
+                        message = await asyncio.wait_for(
+                            aiter.__anext__(), timeout=inactivity_timeout,
+                        )
+                    else:
+                        message = await aiter.__anext__()
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    raise InactivityTimeout(
+                        f"No SDK message for {inactivity_timeout}s"
+                    )
+
+                _msg_count += 1
 
                 if isinstance(message, SystemMessage):
                     if message.subtype == "init":
-                        new_session_id = message.data.get("session_id")
-                        logger.info(f"Task #{task.id} init session: {new_session_id}")
+                        _new_session_id = message.data.get("session_id")
+                        logger.info(f"Task #{task.id} init session: {_new_session_id}")
 
                 elif isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, ToolUseBlock):
-                            tools_used.append(block.name)
+                            _tools.append(block.name)
                             if block.name == "Task":
                                 agent_type = block.input.get("subagent_type", "")
                                 desc = block.input.get("description", "")
                                 if agent_type:
                                     current_agent = agent_type
-                                    agents_invoked.append(agent_type)
+                                    _agents.append(agent_type)
                                     last_activity = f"  > {agent_type}: {desc}"
                                     asyncio.ensure_future(broadcaster.emit(
                                         "agent_invoked", task_id=task.id,
@@ -186,14 +217,38 @@ class Executor:
                             await self._update_status(task, _build_status())
 
                 elif isinstance(message, ResultMessage):
-                    result_text = message.result or ""
-                    if not new_session_id:
-                        new_session_id = message.session_id
+                    _result_text = message.result or ""
+                    if not _new_session_id:
+                        _new_session_id = message.session_id
                     asyncio.ensure_future(broadcaster.emit(
                         "result", task_id=task.id,
-                        text=result_text[:500] if result_text else "",
-                        tools_count=len(tools_used),
+                        text=_result_text[:500] if _result_text else "",
+                        tools_count=len(_tools),
                     ))
+
+            return _msg_count, _result_text, _new_session_id, _tools, _agents
+
+        try:
+            try:
+                # Use inactivity timeout when resuming (large sessions can hang)
+                timeout = SDK_INACTIVITY_TIMEOUT if session_id else 0
+                msg_count, result_text, new_session_id, tools_used, agents_invoked = \
+                    await _run_sdk_query(task.prompt, opts, inactivity_timeout=timeout)
+            except InactivityTimeout:
+                # Resume hung - clear session and retry fresh
+                logger.warning(f"Task #{task.id} resume hung (no activity for {SDK_INACTIVITY_TIMEOUT}s), retrying without resume")
+                self.ctx_mgr.clear_session(task.chat_id, task.context)
+                await self._update_status(task, f"[#{task.id}] Session stale, restarting fresh...")
+                opts_fresh = ClaudeAgentOptions(
+                    model="claude-opus-4-6",
+                    cwd=working_dir,
+                    allowed_tools=["Bash(*)", "Read", "Write", "Edit", "Glob", "Grep", "Task"],
+                    permission_mode="bypassPermissions",
+                    agents=SUBAGENTS,
+                    setting_sources=["project"],
+                )
+                msg_count, result_text, new_session_id, tools_used, agents_invoked = \
+                    await _run_sdk_query(task.prompt, opts_fresh)
 
             logger.info(f"Task #{task.id} multi-agent done: {msg_count} msgs, {len(tools_used)} tools, agents: {agents_invoked}")
 
@@ -201,17 +256,20 @@ class Executor:
             # If SDK fails mid-run, fall back to raw CLI
             logger.warning(f"Task #{task.id} multi-agent failed, falling back to CLI: {e}")
             await self._update_status(task, f"[#{task.id}] Falling back to single agent...")
-            heartbeat_running = False
+            heartbeat_stop.set()
             heartbeat_task.cancel()
+            # Clear session if resume was involved to avoid repeat failures
+            if session_id:
+                self.ctx_mgr.clear_session(task.chat_id, task.context)
             await self._run_claude(task)
             return
 
         finally:
-            heartbeat_running = False
+            heartbeat_stop.set()
             heartbeat_task.cancel()
             try:
-                await heartbeat_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(heartbeat_task, timeout=3)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
 
         if not result_text:
@@ -293,13 +351,16 @@ class Executor:
             return f"{header}\n{last_cli_activity}"
 
         # Heartbeat for CLI path too
-        cli_heartbeat_running = True
+        cli_heartbeat_stop = asyncio.Event()
 
         async def _cli_heartbeat():
-            while cli_heartbeat_running:
-                await asyncio.sleep(10)
-                if cli_heartbeat_running:
-                    await self._update_status(task, _cli_status())
+            while not cli_heartbeat_stop.is_set():
+                try:
+                    await asyncio.wait_for(cli_heartbeat_stop.wait(), timeout=10)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                await self._update_status(task, _cli_status())
 
         cli_hb_task = asyncio.create_task(_cli_heartbeat())
         await self._update_status(task, _cli_status())
@@ -339,11 +400,11 @@ class Executor:
         await proc.wait()
 
         # Stop heartbeat
-        cli_heartbeat_running = False
+        cli_heartbeat_stop.set()
         cli_hb_task.cancel()
         try:
-            await cli_hb_task
-        except asyncio.CancelledError:
+            await asyncio.wait_for(cli_hb_task, timeout=3)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
 
         if not result_text:
