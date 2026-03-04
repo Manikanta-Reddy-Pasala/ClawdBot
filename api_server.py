@@ -534,7 +534,7 @@ async def _run_claude(prompt: str, timeout: int = 90) -> str:
     """Run claude CLI with a prompt and return the text output."""
     cmd = [
         "claude", "-p", "--output-format", "text",
-        "--max-turns", "5", "--dangerously-skip-permissions",
+        "--dangerously-skip-permissions",
     ]
     env = os.environ.copy()
     env.pop("ANTHROPIC_API_KEY", None)
