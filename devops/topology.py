@@ -1,7 +1,11 @@
-"""Service topology with verified ports and health endpoints."""
+"""Service topology with verified ports, health endpoints, and auto-derived relationships."""
 from __future__ import annotations
 
+import logging
+
 from devops.models import ServiceInfo, ServiceTier, ServiceTopology
+
+logger = logging.getLogger(__name__)
 
 SERVICE_TOPOLOGY: dict[str, ServiceInfo] = {
     # --- Critical (core POS flow) ---
@@ -159,12 +163,59 @@ SERVICE_TOPOLOGY: dict[str, ServiceInfo] = {
 }
 
 
+# Known dependency patterns for auto-derivation.
+# Maps a pattern found in service configs/code to an infrastructure dependency.
+_INFRA_PATTERNS = {
+    "mongodb": "MongoDbService",
+    "nats": "nats-server",
+    "redis": "dragonfly",
+    "dragonfly": "dragonfly",
+    "gateway": "GatewayService",
+    "redpanda": "redpanda",
+    "kafka": "redpanda",
+}
+
+
 def build_topology() -> ServiceTopology:
+    """Build topology with edges derived from explicit dependencies."""
     edges = []
+    seen = set()
     for name, info in SERVICE_TOPOLOGY.items():
         for dep in info.dependencies:
-            edges.append({"from": name, "to": dep})
+            key = f"{name}->{dep}"
+            if key not in seen and dep in SERVICE_TOPOLOGY:
+                edges.append({"from": name, "to": dep})
+                seen.add(key)
     return ServiceTopology(
         services=list(SERVICE_TOPOLOGY.values()),
         edges=edges,
     )
+
+
+def get_reverse_dependencies() -> dict[str, list[str]]:
+    """Build reverse dependency map: service -> list of services that depend on it."""
+    rev = {}
+    for name, info in SERVICE_TOPOLOGY.items():
+        for dep in info.dependencies:
+            if dep not in rev:
+                rev[dep] = []
+            rev[dep].append(name)
+    return rev
+
+
+def get_dependency_chain(service_name: str) -> list[str]:
+    """Get full downstream dependency chain for a service (BFS)."""
+    rev = get_reverse_dependencies()
+    visited = set()
+    queue = [service_name]
+    chain = []
+    while queue:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        chain.append(current)
+        for dependent in rev.get(current, []):
+            if dependent not in visited:
+                queue.append(dependent)
+    return chain[1:]  # Exclude the service itself

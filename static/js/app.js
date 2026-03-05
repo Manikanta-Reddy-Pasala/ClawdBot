@@ -94,6 +94,16 @@ document.addEventListener('alpine:init', () => {
         playbooks: [],
         playbookResults: {},
 
+        // Log Monitor
+        logMonitorServices: [],
+        logMonitorIssues: [],
+        logMonitorTickets: [],
+        logMonitorSelectedSvc: '',
+        logMonitorScanning: false,
+        logMonitorLastScan: null,
+        logMonitorAutoScan: false,
+        logMonitorInterval: null,
+
         // Charts
         statusChart: null,
         ws: null,
@@ -628,6 +638,93 @@ document.addEventListener('alpine:init', () => {
                 body: JSON.stringify({ playbook: name, dry_run: dryRun, context: {} }),
             });
             if (data) this.playbookResults[name] = data;
+        },
+
+        // --- Log Monitor ---
+        async loadLogMonitor() {
+            await this.scanLogMonitor();
+            await this.loadLogMonitorTickets();
+            // Start auto-scan watcher
+            this.$watch('logMonitorAutoScan', (val) => {
+                if (val && !this.logMonitorInterval) {
+                    this.logMonitorInterval = setInterval(() => this.scanLogMonitor(), 60000);
+                } else if (!val && this.logMonitorInterval) {
+                    clearInterval(this.logMonitorInterval);
+                    this.logMonitorInterval = null;
+                }
+            });
+        },
+
+        async scanLogMonitor() {
+            this.logMonitorScanning = true;
+            const data = await this.api('/api/v1/logmonitor/scan', { method: 'POST' });
+            if (data) {
+                this.logMonitorServices = data.services || [];
+                this.logMonitorIssues = (data.issues || []).map(i => ({
+                    ...i,
+                    _ticketCreated: false,
+                    _ticket: null,
+                    _diagnosing: false,
+                    _diagResult: null,
+                }));
+                this.logMonitorLastScan = new Date().toISOString();
+                // Auto-select first service with issues
+                if (!this.logMonitorSelectedSvc) {
+                    const withIssues = this.logMonitorServices.find(s => s.issueCount > 0);
+                    if (withIssues) this.logMonitorSelectedSvc = withIssues.name;
+                    else if (this.logMonitorServices.length) this.logMonitorSelectedSvc = this.logMonitorServices[0].name;
+                }
+            }
+            this.logMonitorScanning = false;
+        },
+
+        async loadLogMonitorTickets() {
+            const data = await this.api('/api/v1/logmonitor/tickets');
+            if (data) this.logMonitorTickets = data;
+        },
+
+        filteredLogIssues() {
+            if (!this.logMonitorSelectedSvc) return this.logMonitorIssues;
+            return this.logMonitorIssues.filter(i => i.service === this.logMonitorSelectedSvc);
+        },
+
+        async createTicketAndFix(issue) {
+            issue._ticketCreated = true;
+            const data = await this.api('/api/v1/logmonitor/ticket', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    service: issue.service,
+                    namespace: issue.namespace || 'default',
+                    severity: issue.severity,
+                    category: issue.category,
+                    description: issue.description,
+                    matched_line: issue.matched_line,
+                    recommendation: issue.recommendation || '',
+                }),
+            });
+            if (data?.ticket) {
+                issue._ticket = data.ticket;
+                this.logMonitorTickets.unshift(data.ticket);
+            }
+        },
+
+        async diagnoseIssueFromMonitor(issue) {
+            issue._diagnosing = true;
+            issue._diagResult = null;
+            const data = await this.api('/api/v1/logmonitor/diagnose', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    service: issue.service,
+                    description: issue.description,
+                    matched_line: issue.matched_line,
+                }),
+            });
+            if (data?.diagnosis) {
+                issue._diagResult = data.diagnosis;
+            }
+            issue._diagnosing = false;
         },
 
         formatBytes(bytes) {

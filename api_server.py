@@ -34,6 +34,14 @@ from devops.approval import (
     get_all as get_all_approvals,
 )
 from devops.models import Severity
+from devops.log_monitor import (
+    scan_all_services as lm_scan_all,
+    create_ticket as lm_create_ticket,
+    get_tickets as lm_get_tickets,
+    get_ticket as lm_get_ticket,
+    update_ticket as lm_update_ticket,
+    build_clawdbot_prompt as lm_build_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -538,7 +546,7 @@ async def _start_claude_stream(task_id: str, prompt: str):
                     final_text_parts.append(result_text)
                 task["events"].append({
                     "type": "status",
-                    "message": f"Done. Cost: ${evt.get('total_cost_usd', 0):.3f}, Turns: {evt.get('num_turns', '?')}",
+                    "message": f"Done. Turns: {evt.get('num_turns', '?')}",
                     "ts": _ts(),
                 })
 
@@ -1191,33 +1199,111 @@ async def restart_debezium(connector: str):
 
 
 # --- Certificates ---
+# Monitors the oneshell-credential TLS secret in default namespace.
+# This is a manually-managed cert (not cert-manager), created via:
+#   kubectl create -n default secret tls oneshell-credential --key=oneshell.key --cert=oneshell.crt
+
+_CERT_SECRET_NAME = "oneshell-credential"
+_CERT_SECRET_NAMESPACE = "default"
+
+
+async def _parse_tls_secret(secret_name: str, namespace: str) -> dict:
+    """Extract certificate details from a TLS secret."""
+    from devops import k8s_client
+    import base64
+
+    raw = await k8s_client._run_kubectl(
+        "get", "secret", secret_name, "-n", namespace, "-o", "json",
+    )
+    if not raw or "not found" in raw.lower():
+        return {"name": secret_name, "namespace": namespace, "error": "Secret not found"}
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {"name": secret_name, "namespace": namespace, "error": "Failed to parse secret"}
+
+    cert_b64 = data.get("data", {}).get("tls.crt", "")
+    if not cert_b64:
+        return {"name": secret_name, "namespace": namespace, "error": "No tls.crt in secret"}
+
+    # Decode and parse cert using openssl via kubectl exec or local openssl
+    cert_pem = base64.b64decode(cert_b64).decode("utf-8", errors="replace")
+
+    # Use openssl to extract cert details
+    proc = await asyncio.create_subprocess_exec(
+        "openssl", "x509", "-noout", "-subject", "-issuer",
+        "-dates", "-serial", "-ext", "subjectAltName",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(cert_pem.encode()), timeout=10)
+    output = stdout.decode("utf-8", errors="replace")
+
+    result = {
+        "name": secret_name,
+        "namespace": namespace,
+        "type": "TLS Secret",
+        "ready": True,
+    }
+
+    # Parse openssl output
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("subject="):
+            result["subject"] = line.split("=", 1)[1].strip()
+            # Extract domain from CN
+            cn_parts = [p.strip() for p in result["subject"].split(",")]
+            for p in cn_parts:
+                if p.startswith("CN =") or p.startswith("CN="):
+                    result["domain"] = p.split("=", 1)[1].strip()
+        elif line.startswith("issuer="):
+            result["issuer"] = line.split("=", 1)[1].strip()
+        elif line.startswith("notBefore="):
+            result["not_before"] = line.split("=", 1)[1].strip()
+        elif line.startswith("notAfter="):
+            not_after_str = line.split("=", 1)[1].strip()
+            result["not_after"] = not_after_str
+            # Calculate days remaining
+            try:
+                from datetime import datetime as dt
+                # openssl format: "Mon DD HH:MM:SS YYYY GMT"
+                expiry = dt.strptime(not_after_str, "%b %d %H:%M:%S %Y %Z")
+                now = dt.utcnow()
+                delta = expiry - now
+                result["days_remaining"] = delta.days
+                result["expired"] = delta.days < 0
+                result["expiring_soon"] = 0 <= delta.days <= 14
+            except Exception:
+                pass
+        elif "DNS:" in line:
+            sans = [s.strip().replace("DNS:", "") for s in line.split(",") if "DNS:" in s]
+            result["san_domains"] = sans
+
+    return result
+
 
 @app.get("/api/v1/certificates", dependencies=[Depends(verify_api_key)])
 async def list_certificates():
-    from devops import k8s_client
-    raw = await k8s_client._run_kubectl("get", "certificates", "-A", "-o", "json")
-    import json as j
-    try:
-        data = j.loads(raw) if raw else {"items": []}
-        return [{"name": i["metadata"]["name"], "namespace": i["metadata"]["namespace"],
-                 "ready": any(c.get("type") == "Ready" and c.get("status") == "True" for c in i.get("status", {}).get("conditions", []))}
-                for i in data.get("items", [])]
-    except Exception:
-        return []
+    cert = await _parse_tls_secret(_CERT_SECRET_NAME, _CERT_SECRET_NAMESPACE)
+    return [cert]
 
 
 @app.get("/api/v1/certificates/status", dependencies=[Depends(verify_api_key)])
 async def certificate_status():
-    from devops import k8s_client
-    raw = await k8s_client._run_kubectl("get", "certificates", "-A")
-    return {"status": raw}
+    cert = await _parse_tls_secret(_CERT_SECRET_NAME, _CERT_SECRET_NAMESPACE)
+    return cert
 
 
 @app.post("/api/v1/certificates/{name}/renew", dependencies=[Depends(verify_api_key)])
 async def renew_certificate(name: str):
+    """Delete the TLS secret so it can be re-created with a new cert.
+    User must re-create it manually: kubectl create -n default secret tls oneshell-credential --key=oneshell.key --cert=oneshell.crt
+    """
     from devops import k8s_client
-    result = await k8s_client._run_kubectl("delete", "secret", name, "-n", "default")
-    return {"result": result}
+    result = await k8s_client._run_kubectl("delete", "secret", name, "-n", _CERT_SECRET_NAMESPACE)
+    return {"result": result, "note": f"Secret deleted. Re-create with: kubectl create -n {_CERT_SECRET_NAMESPACE} secret tls {name} --key=oneshell.key --cert=oneshell.crt"}
 
 
 # --- Tasks (ClawdBot task queue) ---
@@ -1298,6 +1384,172 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.websocket("/api/v1/dashboard/ws")
 async def websocket_dashboard(websocket: WebSocket):
     await _handle_ws(websocket)
+
+
+# --- Log Monitor ---
+
+@app.post("/api/v1/logmonitor/scan", dependencies=[Depends(verify_api_key)])
+async def logmonitor_scan():
+    """Scan all core services for log issues."""
+    result = await lm_scan_all()
+    return result
+
+
+@app.get("/api/v1/logmonitor/tickets", dependencies=[Depends(verify_api_key)])
+async def logmonitor_tickets():
+    """Get all log monitor tickets."""
+    return lm_get_tickets()
+
+
+@app.post("/api/v1/logmonitor/ticket", dependencies=[Depends(verify_api_key)])
+async def logmonitor_create_ticket(request: Request):
+    """Create a ticket and dispatch to ClawdBot for auto-fix."""
+    data = await request.json()
+    ticket = lm_create_ticket(
+        service=data["service"],
+        namespace=data.get("namespace", "default"),
+        severity=data.get("severity", "WARNING"),
+        category=data.get("category", ""),
+        description=data["description"],
+        matched_line=data.get("matched_line", ""),
+        recommendation=data.get("recommendation", ""),
+    )
+
+    # Dispatch to ClawdBot via the internal task mechanism
+    asyncio.create_task(_dispatch_to_clawdbot(ticket))
+
+    return {"ticket": ticket}
+
+
+@app.post("/api/v1/logmonitor/diagnose", dependencies=[Depends(verify_api_key)])
+async def logmonitor_diagnose(request: Request):
+    """Quick AI diagnosis of an issue without creating a ticket."""
+    data = await request.json()
+    service = data.get("service", "")
+    description = data.get("description", "")
+    matched_line = data.get("matched_line", "")
+
+    prompt = f"Quickly diagnose this issue in {service}:\n{description}\nLog: {matched_line}\nCheck recent logs and suggest the likely root cause in 2-3 sentences."
+
+    task_id = secrets.token_hex(8)
+    _ai_tasks[task_id] = {
+        "status": "starting", "events": [], "process": None,
+        "final_output": "", "started_at": time.time(),
+        "issue": description, "service": service,
+    }
+
+    # Run Claude for quick diagnosis (blocking, short timeout)
+    try:
+        await _start_claude_stream(task_id, prompt)
+        # Wait briefly for output
+        for _ in range(30):
+            await asyncio.sleep(1)
+            task = _ai_tasks.get(task_id, {})
+            if task.get("status") == "done" or task.get("final_output"):
+                break
+        diagnosis = _ai_tasks.get(task_id, {}).get("final_output", "No diagnosis available")
+        return {"diagnosis": diagnosis}
+    except Exception as e:
+        return {"diagnosis": f"Diagnosis failed: {str(e)}"}
+
+
+async def _dispatch_to_clawdbot(ticket: dict):
+    """Dispatch a ticket to ClawdBot for investigation and fix."""
+    import aiohttp
+
+    ticket_id = ticket["id"]
+    lm_update_ticket(ticket_id, {"status": "investigating"})
+
+    prompt = lm_build_prompt(ticket)
+
+    # Use the AI task streaming mechanism
+    task_id = secrets.token_hex(8)
+    _ai_tasks[task_id] = {
+        "status": "starting", "events": [], "process": None,
+        "final_output": "", "started_at": time.time(),
+        "issue": ticket["description"], "service": ticket["service"],
+    }
+    lm_update_ticket(ticket_id, {"clawdbot_task_id": task_id})
+
+    try:
+        await _start_claude_stream(task_id, prompt)
+
+        # Monitor the task until completion (max 10 min)
+        for _ in range(600):
+            await asyncio.sleep(1)
+            task = _ai_tasks.get(task_id, {})
+            if task.get("status") == "done" or task.get("final_output"):
+                break
+
+        output = _ai_tasks.get(task_id, {}).get("final_output", "")
+        lm_update_ticket(ticket_id, {
+            "clawdbot_output": output[:2000],
+            "status": "testing",
+        })
+
+        # Check if MR was created (look for github.com URL in output)
+        import re
+        mr_match = re.search(r'https://github\.com/\S+/pull/\d+', output)
+        if mr_match:
+            lm_update_ticket(ticket_id, {
+                "mr_url": mr_match.group(0),
+                "status": "mr_created",
+            })
+
+        # Send Telegram notification
+        await _notify_telegram(ticket)
+
+        lm_update_ticket(ticket_id, {"telegram_notified": True})
+
+        # If MR was created, mark as resolved
+        if mr_match:
+            lm_update_ticket(ticket_id, {"status": "resolved"})
+        else:
+            lm_update_ticket(ticket_id, {"status": "investigated"})
+
+    except Exception as e:
+        logger.error("ClawdBot dispatch failed for ticket %d: %s", ticket_id, e)
+        lm_update_ticket(ticket_id, {
+            "status": "failed",
+            "clawdbot_output": f"Error: {str(e)}",
+        })
+
+
+async def _notify_telegram(ticket: dict):
+    """Send ticket status to Telegram."""
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("ALERT_CHAT_ID", "")
+    if not bot_token or not chat_id:
+        logger.warning("Telegram not configured, skipping notification")
+        return
+
+    status_emoji = {
+        "resolved": "OK", "mr_created": "PR", "investigated": "INFO",
+        "failed": "FAIL", "testing": "TEST",
+    }.get(ticket["status"], "TICKET")
+
+    text = (
+        f"[{status_emoji}] Log Monitor Ticket #{ticket['id']}\n"
+        f"Service: {ticket['service']}\n"
+        f"Severity: {ticket['severity']}\n"
+        f"Issue: {ticket['description'][:200]}\n"
+        f"Status: {ticket['status']}\n"
+    )
+    if ticket.get("mr_url"):
+        text += f"MR: {ticket['mr_url']}\n"
+    if ticket.get("clawdbot_output"):
+        text += f"\nOutput (truncated):\n{ticket['clawdbot_output'][:500]}"
+
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            await session.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+    except Exception as e:
+        logger.error("Telegram notification failed: %s", e)
 
 
 # --- Static files (dashboard) ---

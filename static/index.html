@@ -46,6 +46,9 @@
             Incidents <span x-show="overview.active_incidents > 0" class="badge" x-text="overview.active_incidents"></span>
         </button>
         <button :class="tab === 'remediation' && 'active'" @click="tab = 'remediation'; loadPlaybooks()">Remediation</button>
+        <button :class="tab === 'logmonitor' && 'active'" @click="tab = 'logmonitor'; loadLogMonitor()">
+            Log Monitor <span x-show="logMonitorTickets.filter(t => t.status !== 'resolved').length > 0" class="badge critical" x-text="logMonitorTickets.filter(t => t.status !== 'resolved').length"></span>
+        </button>
     </nav>
 
     <main>
@@ -686,9 +689,13 @@
         <!-- Certificates Tab -->
         <div x-show="tab === 'certs'" class="tab-content">
             <h2>TLS Certificates</h2>
+            <div class="alert info" style="margin-bottom:16px; font-size:12px; line-height:1.6;">
+                Monitors the <code>oneshell-credential</code> TLS secret in <code>default</code> namespace.<br>
+                Renewal: <code>kubectl create -n default secret tls oneshell-credential --key=oneshell.key --cert=oneshell.crt</code>
+            </div>
             <div class="section">
                 <template x-for="cert in certificates">
-                    <div class="service-card" :class="cert.expired ? 'critical' : cert.expiring_soon ? 'degraded' : 'healthy'">
+                    <div class="service-card" :class="cert.expired ? 'critical' : cert.expiring_soon ? 'degraded' : 'healthy'" style="max-width:500px;">
                         <h4 x-text="cert.name"></h4>
                         <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:4px;">
                             <span x-show="cert.domain" class="ns" x-text="cert.domain"></span>
@@ -703,11 +710,15 @@
                                   :style="'font-weight:600; color:' + (cert.days_remaining < 7 ? 'var(--critical)' : cert.days_remaining < 14 ? 'var(--degraded)' : 'var(--healthy)')"
                                   x-text="cert.days_remaining + ' days remaining'"></span>
                         </div>
-                        <div x-show="cert.not_after" class="response-time" x-text="'Expires: ' + cert.not_after"></div>
+                        <div x-show="cert.not_after" style="font-size:12px; margin:4px 0;" x-text="'Expires: ' + cert.not_after"></div>
                         <div x-show="cert.not_before" style="font-size:11px; color:var(--text-dim);" x-text="'Issued: ' + cert.not_before"></div>
+                        <div x-show="cert.issuer" style="font-size:11px; color:var(--text-dim); margin-top:4px;" x-text="'Issuer: ' + cert.issuer"></div>
+                        <div x-show="cert.san_domains?.length > 0" style="font-size:11px; color:var(--text-dim); margin-top:4px;">
+                            SANs: <span x-text="cert.san_domains?.join(', ')"></span>
+                        </div>
                         <div x-show="cert.ready === false" class="error">Certificate not ready</div>
                         <div x-show="cert.error" class="error" x-text="cert.error"></div>
-                        <button x-show="cert.expiring_soon || cert.expired" class="btn btn-sm" @click="renewCert(cert.name)">Trigger Renewal</button>
+                        <button x-show="cert.expiring_soon || cert.expired" class="btn btn-sm" style="margin-top:8px;" @click="renewCert(cert.name)">Delete Secret (for Re-creation)</button>
                     </div>
                 </template>
                 <div x-show="certificates.length === 0" class="empty">No certificates found. Click the tab again to refresh.</div>
@@ -1133,6 +1144,136 @@
                         </div>
                     </div>
                 </template>
+            </div>
+        </div>
+
+        <!-- Log Monitor Tab -->
+        <div x-show="tab === 'logmonitor'" class="tab-content">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+                <h2>Log Monitor</h2>
+                <div style="display:flex; gap:8px; align-items:center;">
+                    <span style="font-size:11px; color:var(--text-dim);" x-text="logMonitorLastScan ? ('Last scan: ' + new Date(logMonitorLastScan).toLocaleTimeString()) : 'Not scanned yet'"></span>
+                    <button class="btn btn-sm" @click="scanLogMonitor()" :disabled="logMonitorScanning">
+                        <span x-text="logMonitorScanning ? 'Scanning...' : 'Scan Now'"></span>
+                    </button>
+                    <label style="font-size:12px; display:flex; align-items:center; gap:4px;">
+                        <input type="checkbox" x-model="logMonitorAutoScan"> Auto (60s)
+                    </label>
+                </div>
+            </div>
+
+            <div class="log-monitor-grid">
+                <!-- Sidebar: Service list -->
+                <div class="log-monitor-sidebar">
+                    <div style="font-size:11px; color:var(--text-dim); padding:4px 0; font-weight:600;">CORE SERVICES</div>
+                    <template x-for="svc in logMonitorServices">
+                        <button class="log-svc-btn" :class="logMonitorSelectedSvc === svc.name && 'active'"
+                                @click="logMonitorSelectedSvc = svc.name">
+                            <span class="svc-dot" :class="svc.issueCount > 0 ? (svc.maxSeverity === 'CRITICAL' || svc.maxSeverity === 'critical' ? 'error' : 'warn') : 'ok'"></span>
+                            <span class="svc-name" x-text="svc.name"></span>
+                            <span x-show="svc.issueCount > 0" class="svc-count badge"
+                                  :class="svc.maxSeverity === 'CRITICAL' ? 'critical' : 'degraded'"
+                                  x-text="svc.issueCount"></span>
+                        </button>
+                    </template>
+                </div>
+
+                <!-- Main: Issues/Tickets for selected service -->
+                <div class="log-monitor-main">
+                    <!-- Stats bar -->
+                    <div style="display:flex; gap:16px; align-items:center; padding:10px 14px; background:var(--surface); border-radius:8px; border:1px solid var(--border);">
+                        <span style="font-size:13px; font-weight:600;" x-text="logMonitorSelectedSvc || 'All Services'"></span>
+                        <span style="font-size:12px; color:var(--text-dim);" x-text="filteredLogIssues().length + ' issues detected'"></span>
+                        <span x-show="logMonitorTickets.filter(t => t.service === logMonitorSelectedSvc && t.status !== 'resolved').length > 0"
+                              style="font-size:12px; color:var(--accent);"
+                              x-text="logMonitorTickets.filter(t => t.service === logMonitorSelectedSvc && t.status !== 'resolved').length + ' active tickets'">
+                        </span>
+                    </div>
+
+                    <!-- Detected Issues -->
+                    <template x-for="issue in filteredLogIssues()">
+                        <div class="ticket-card" :class="issue.severity === 'CRITICAL' ? 'critical' : issue.severity === 'WARNING' ? 'warning' : 'info'">
+                            <div class="ticket-header">
+                                <div style="display:flex; align-items:center; gap:8px;">
+                                    <span class="badge" :class="issue.severity === 'CRITICAL' ? 'critical' : issue.severity === 'WARNING' ? 'degraded' : 'info'"
+                                          x-text="issue.severity"></span>
+                                    <span style="font-size:12px; color:var(--text-dim);" x-text="issue.category"></span>
+                                </div>
+                                <span style="font-size:11px; color:var(--text-dim);" x-text="issue.service + ' | ' + issue.namespace"></span>
+                            </div>
+                            <div style="font-size:13px; margin-bottom:6px;" x-text="issue.description"></div>
+                            <div style="font-family:monospace; font-size:11px; background:rgba(0,0,0,0.3); padding:6px 10px; border-radius:4px; max-height:60px; overflow:hidden; color:var(--text-dim);"
+                                 x-text="issue.matched_line"></div>
+                            <div x-show="issue.recommendation" style="margin-top:6px; font-size:12px; color:var(--info);">
+                                <span x-text="issue.recommendation"></span>
+                            </div>
+                            <div class="ticket-actions">
+                                <button class="btn btn-sm" @click="createTicketAndFix(issue)"
+                                        :disabled="issue._ticketCreated"
+                                        x-text="issue._ticketCreated ? 'Ticket Created' : 'Create Ticket & Fix'"></button>
+                                <button class="btn btn-sm" @click="diagnoseIssueFromMonitor(issue)"
+                                        :disabled="issue._diagnosing">
+                                    <span x-text="issue._diagnosing ? 'Diagnosing...' : 'Quick Diagnose'"></span>
+                                </button>
+                            </div>
+                            <!-- Pipeline status for this issue -->
+                            <div x-show="issue._ticket" class="pipeline-status">
+                                <span class="pipeline-step" :class="issue._ticket?.status === 'created' ? 'running' : 'done'">Ticket</span>
+                                <span style="color:var(--text-dim);">-></span>
+                                <span class="pipeline-step" :class="issue._ticket?.status === 'investigating' ? 'running' : (issue._ticket?.status && issue._ticket.status !== 'created' ? 'done' : 'pending')">ClawdBot Fix</span>
+                                <span style="color:var(--text-dim);">-></span>
+                                <span class="pipeline-step" :class="issue._ticket?.status === 'testing' ? 'running' : (issue._ticket?.status === 'mr_created' || issue._ticket?.status === 'resolved' ? 'done' : 'pending')">QA Test</span>
+                                <span style="color:var(--text-dim);">-></span>
+                                <span class="pipeline-step" :class="issue._ticket?.status === 'mr_created' ? 'running' : (issue._ticket?.status === 'resolved' ? 'done' : 'pending')">Merge Request</span>
+                                <span style="color:var(--text-dim);">-></span>
+                                <span class="pipeline-step" :class="issue._ticket?.status === 'resolved' ? 'done' : 'pending'">Notified</span>
+                            </div>
+                            <!-- AI diagnosis output -->
+                            <div x-show="issue._diagResult" style="margin-top:8px; background:rgba(0,0,0,0.2); padding:10px; border-radius:6px; max-height:200px; overflow-y:auto;">
+                                <pre style="white-space:pre-wrap; font-size:11px; margin:0;" x-text="issue._diagResult"></pre>
+                            </div>
+                        </div>
+                    </template>
+
+                    <div x-show="filteredLogIssues().length === 0 && !logMonitorScanning" class="alert info">
+                        No issues detected for <span x-text="logMonitorSelectedSvc || 'any service'"></span>. All clear.
+                    </div>
+
+                    <!-- Tickets section -->
+                    <div x-show="logMonitorTickets.length > 0" style="margin-top:16px;">
+                        <h3 style="margin-bottom:10px;">Active Tickets</h3>
+                        <template x-for="ticket in logMonitorTickets.filter(t => !logMonitorSelectedSvc || t.service === logMonitorSelectedSvc)">
+                            <div class="ticket-card" :class="ticket.severity === 'CRITICAL' ? 'critical' : 'warning'" style="margin-bottom:8px;">
+                                <div class="ticket-header">
+                                    <div style="display:flex; align-items:center; gap:8px;">
+                                        <span style="font-weight:600; font-size:12px;" x-text="'#' + ticket.id"></span>
+                                        <span class="badge" :class="ticket.status === 'resolved' ? 'healthy' : ticket.status === 'failed' ? 'critical' : 'degraded'"
+                                              x-text="ticket.status"></span>
+                                    </div>
+                                    <span style="font-size:11px; color:var(--text-dim);" x-text="new Date(ticket.created_at).toLocaleString()"></span>
+                                </div>
+                                <div style="font-size:13px;" x-text="ticket.description"></div>
+                                <div class="pipeline-status">
+                                    <span class="pipeline-step" :class="ticket.status === 'created' ? 'running' : 'done'">Ticket</span>
+                                    <span style="color:var(--text-dim);">-></span>
+                                    <span class="pipeline-step" :class="ticket.status === 'investigating' ? 'running' : (['testing','mr_created','resolved'].includes(ticket.status) ? 'done' : 'pending')">ClawdBot Fix</span>
+                                    <span style="color:var(--text-dim);">-></span>
+                                    <span class="pipeline-step" :class="ticket.status === 'testing' ? 'running' : (['mr_created','resolved'].includes(ticket.status) ? 'done' : 'pending')">QA Test</span>
+                                    <span style="color:var(--text-dim);">-></span>
+                                    <span class="pipeline-step" :class="ticket.status === 'mr_created' ? 'running' : (ticket.status === 'resolved' ? 'done' : 'pending')">MR</span>
+                                    <span style="color:var(--text-dim);">-></span>
+                                    <span class="pipeline-step" :class="ticket.status === 'resolved' ? 'done' : 'pending'">Done</span>
+                                </div>
+                                <div x-show="ticket.clawdbot_output" style="margin-top:8px; background:rgba(0,0,0,0.2); padding:8px; border-radius:4px; max-height:150px; overflow-y:auto;">
+                                    <pre style="white-space:pre-wrap; font-size:11px; margin:0;" x-text="ticket.clawdbot_output"></pre>
+                                </div>
+                                <div x-show="ticket.mr_url" style="margin-top:6px;">
+                                    <a :href="ticket.mr_url" target="_blank" style="color:var(--accent); font-size:12px;" x-text="'MR: ' + ticket.mr_url"></a>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
             </div>
         </div>
     </main>
