@@ -18,26 +18,43 @@ def _base_cmd() -> list[str]:
     return [KUBECTL, f"--kubeconfig={KUBECONFIG}", "--insecure-skip-tls-verify"]
 
 
-async def _run_kubectl(*args, timeout: int = 30) -> str:
+async def _run_kubectl(*args, timeout: int = 30, retries: int = 2) -> str:
     cmd = _base_cmd() + list(args)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        if proc.returncode != 0:
-            err = stderr.decode(errors="replace").strip()
-            logger.error(f"kubectl error: {err[:500]}")
+    last_err = ""
+    for attempt in range(1, retries + 1):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode != 0:
+                last_err = stderr.decode(errors="replace").strip()
+                # Retry on transient errors (connection refused, timeout, EOF)
+                if attempt < retries and any(s in last_err.lower() for s in (
+                    "connection refused", "timed out", "timeout", "eof",
+                    "tls handshake", "broken pipe", "connection reset",
+                )):
+                    logger.warning(f"kubectl transient error (attempt {attempt}/{retries}): {last_err[:200]}")
+                    await asyncio.sleep(2 * attempt)
+                    continue
+                logger.error(f"kubectl error: {last_err[:500]}")
+                return ""
+            return stdout.decode(errors="replace").strip()
+        except asyncio.TimeoutError:
+            last_err = f"timed out after {timeout}s"
+            if attempt < retries:
+                logger.warning(f"kubectl timeout (attempt {attempt}/{retries}): {' '.join(args[:5])}")
+                await asyncio.sleep(2 * attempt)
+                continue
+            logger.error(f"kubectl timed out after {retries} attempts: {' '.join(args[:5])}")
             return ""
-        return stdout.decode(errors="replace").strip()
-    except asyncio.TimeoutError:
-        logger.error(f"kubectl timed out: {' '.join(args[:5])}")
-        return ""
-    except Exception as e:
-        logger.error(f"kubectl failed: {e}")
-        return ""
+        except Exception as e:
+            logger.error(f"kubectl failed: {e}")
+            return ""
+    logger.error(f"kubectl failed after {retries} attempts: {last_err[:200]}")
+    return ""
 
 
 async def _run_kubectl_json(*args, timeout: int = 30) -> dict | list:

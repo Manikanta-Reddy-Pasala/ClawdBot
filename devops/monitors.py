@@ -7,6 +7,8 @@ import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 
+import json
+
 from devops import k8s_client, mongodb_client, nats_client
 from devops.models import (
     ClusterOverview, HealthStatus, ServiceHealth, MongoHealth,
@@ -25,6 +27,11 @@ POD_RESTART_THRESHOLD = 5
 MONGODB_CONNECTION_WARNING = 400
 MONGODB_CONNECTION_CRITICAL = 800
 NATS_CONSUMER_LAG_THRESHOLD = 500
+
+# External service URLs (not in-cluster, checked via HTTPS)
+EXTERNAL_SERVICE_URLS = {
+    "harbor": "https://docker.oneshell.in/api/v2.0/health",
+}
 
 
 class BaseMonitor(ABC):
@@ -127,31 +134,108 @@ class ServiceHealthMonitor(BaseMonitor):
     async def _check_service(self, name: str, info) -> ServiceHealth:
         health = ServiceHealth(name=name, namespace=info.namespace)
         svc_name = name.lower()
-        # Use kubectl exec curl from within the cluster
         start = time.time()
         try:
-            exec_info = await self._get_exec_pod()
-            if not exec_info:
-                health.status = HealthStatus.CRITICAL
-                health.error = "No exec pod available"
-                self.services[name] = health
-                return health
-            exec_pod, exec_ns = exec_info
-            raw = await k8s_client.exec_in_pod(
-                exec_pod, exec_ns,
-                ["curl", "-s", "--max-time", "5",
-                 f"http://{svc_name}.{info.namespace}.svc:{info.port}{info.health_path}"],
-                timeout=10,
-            )
+            # External services (e.g. Harbor) - check via curl from exec pod using external URL
+            if info.namespace == "external":
+                raw = await self._check_external_service(name, info)
+            else:
+                # In-cluster services - use kubectl exec curl
+                exec_info = await self._get_exec_pod()
+                if not exec_info:
+                    health.status = HealthStatus.CRITICAL
+                    health.error = "No exec pod available"
+                    self.services[name] = health
+                    return health
+                exec_pod, exec_ns = exec_info
+                raw = await k8s_client.exec_in_pod(
+                    exec_pod, exec_ns,
+                    ["curl", "-s", "--max-time", "5",
+                     f"http://{svc_name}.{info.namespace}.svc:{info.port}{info.health_path}"],
+                    timeout=10,
+                )
             health.response_time_ms = round((time.time() - start) * 1000, 1)
-            health.status = HealthStatus.HEALTHY if raw else HealthStatus.DEGRADED
-        except Exception:
+            if not raw:
+                health.status = HealthStatus.DEGRADED
+                health.error = "Empty response"
+            else:
+                # Parse actuator/health JSON to detect DOWN status
+                health.status = self._parse_health_response(raw)
+                if health.status in (HealthStatus.CRITICAL, HealthStatus.DEGRADED):
+                    health.error = self._extract_health_error(raw)
+        except Exception as e:
             health.status = HealthStatus.CRITICAL
-            health.error = "Connection failed"
+            health.error = f"Connection failed: {str(e)[:100]}"
             health.response_time_ms = round((time.time() - start) * 1000, 1)
 
         self.services[name] = health
         return health
+
+    async def _check_external_service(self, name: str, info) -> str:
+        """Check external services via curl from an exec pod."""
+        urls = EXTERNAL_SERVICE_URLS.get(name)
+        if not urls:
+            return ""
+        exec_info = await self._get_exec_pod()
+        if not exec_info:
+            return ""
+        exec_pod, exec_ns = exec_info
+        return await k8s_client.exec_in_pod(
+            exec_pod, exec_ns,
+            ["curl", "-sk", "--max-time", "8", urls],
+            timeout=15,
+        )
+
+    @staticmethod
+    def _parse_health_response(raw: str) -> HealthStatus:
+        """Parse health response body. Handles Spring Boot actuator and Harbor health formats."""
+        try:
+            data = json.loads(raw)
+            status = data.get("status", "").upper()
+
+            # Spring Boot actuator format: {"status": "UP/DOWN", "components": {...}}
+            if status in ("DOWN", "OUT_OF_SERVICE"):
+                return HealthStatus.CRITICAL
+            if status == "UP":
+                components = data.get("components", {})
+                for comp_name, comp in components.items():
+                    if isinstance(comp, dict) and comp.get("status", "").upper() in ("DOWN", "OUT_OF_SERVICE"):
+                        return HealthStatus.DEGRADED
+                return HealthStatus.HEALTHY
+
+            # Harbor format: {"status": "healthy", "components": [{"name": "...", "status": "healthy"}]}
+            if status == "HEALTHY":
+                return HealthStatus.HEALTHY
+            components = data.get("components", [])
+            if isinstance(components, list) and components:
+                unhealthy = [c for c in components if isinstance(c, dict) and c.get("status", "").lower() != "healthy"]
+                if unhealthy:
+                    return HealthStatus.DEGRADED
+                return HealthStatus.HEALTHY
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        # Non-JSON response (e.g. plain text from nginx / frontend) — treat any response as healthy
+        return HealthStatus.HEALTHY
+
+    @staticmethod
+    def _extract_health_error(raw: str) -> str:
+        """Extract error details from a health response for logging."""
+        try:
+            data = json.loads(raw)
+            components = data.get("components", {})
+            if isinstance(components, dict):
+                down = [k for k, v in components.items()
+                        if isinstance(v, dict) and v.get("status", "").upper() in ("DOWN", "OUT_OF_SERVICE")]
+                if down:
+                    return f"Components DOWN: {', '.join(down)}"
+            if isinstance(components, list):
+                unhealthy = [c.get("name", "?") for c in components
+                             if isinstance(c, dict) and c.get("status", "").lower() != "healthy"]
+                if unhealthy:
+                    return f"Unhealthy: {', '.join(unhealthy)}"
+            return f"Status: {data.get('status', 'unknown')}"
+        except Exception:
+            return "Health check returned non-OK"
 
     async def _get_exec_pod(self) -> tuple[str, str] | None:
         """Get a running pod with curl for internal HTTP calls. Returns (pod_name, namespace)."""

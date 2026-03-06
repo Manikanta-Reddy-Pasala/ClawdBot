@@ -160,6 +160,11 @@ SERVICE_TOPOLOGY: dict[str, ServiceInfo] = {
         dependencies=["redpanda"],
         health_path="/",
     ),
+    "harbor": ServiceInfo(
+        name="harbor", namespace="external", port=443,
+        tier=ServiceTier.IMPORTANT, dependencies=[],
+        health_path="/api/v2.0/health",
+    ),
 }
 
 

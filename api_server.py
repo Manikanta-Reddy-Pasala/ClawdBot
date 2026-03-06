@@ -41,6 +41,18 @@ from devops.log_monitor import (
     get_ticket as lm_get_ticket,
     update_ticket as lm_update_ticket,
     build_clawdbot_prompt as lm_build_prompt,
+    start_auto_scan as lm_start_auto_scan,
+    stop_auto_scan as lm_stop_auto_scan,
+    get_last_scan_result as lm_get_last_scan,
+)
+from devops.ticket_db import (
+    init_db as init_ticket_db,
+    cleanup_old_tickets,
+    get_ticket_stats,
+    save_passkey_credential,
+    get_passkey_credential,
+    get_passkey_credentials_for_user,
+    update_passkey_sign_count,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +67,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def _on_startup():
+    """Start background tasks on API server startup."""
+    # Initialize SQLite ticket database
+    init_ticket_db()
+    cleanup_old_tickets()
+    logger.info("Ticket database initialized and cleaned up")
+
+    # Schedule daily cleanup
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    _cleanup_scheduler = AsyncIOScheduler()
+    _cleanup_scheduler.add_job(cleanup_old_tickets, "interval", hours=24)
+    _cleanup_scheduler.start()
+
+    # Start auto-scan loop (every 5 min), auto-creates tickets for CRITICAL issues
+    lm_start_auto_scan(dispatch_fn=_dispatch_to_clawdbot, interval_seconds=300)
+    logger.info("Log monitor auto-scan started")
 
 
 # --- Auth ---
@@ -120,7 +151,7 @@ LOGIN_HTML = """<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0a0e1a;color:#e0e0e0;font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:100vh}
-.login{background:#111827;border:1px solid #1e293b;border-radius:12px;padding:40px;width:360px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+.login{background:#111827;border:1px solid #1e293b;border-radius:12px;padding:40px;width:380px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
 h1{font-size:24px;margin-bottom:8px;text-align:center}
 .sub{color:#8b8fa3;font-size:13px;text-align:center;margin-bottom:24px}
 label{display:block;font-size:13px;color:#8b8fa3;margin-bottom:4px}
@@ -128,7 +159,12 @@ input{width:100%;padding:10px 12px;background:#0a0e1a;border:1px solid #1e293b;b
 input:focus{border-color:#3b82f6}
 button{width:100%;padding:10px;background:#3b82f6;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer}
 button:hover{background:#2563eb}
+.btn-passkey{background:#6366f1;margin-top:12px}
+.btn-passkey:hover{background:#4f46e5}
+.divider{display:flex;align-items:center;gap:12px;margin:20px 0;color:#4b5563;font-size:12px}
+.divider::before,.divider::after{content:'';flex:1;border-top:1px solid #1e293b}
 .error{color:#ef4444;font-size:13px;text-align:center;margin-bottom:12px}
+.passkey-status{font-size:12px;text-align:center;margin-top:8px;color:#8b8fa3}
 </style></head><body>
 <div class="login">
 <h1>AiDevOps</h1>
@@ -138,7 +174,45 @@ button:hover{background:#2563eb}
 <label>Username</label><input name="username" required autofocus>
 <label>Password</label><input name="password" type="password" required>
 <button type="submit">Sign In</button>
-</form></div></body></html>"""
+</form>
+<div id="passkey-section" style="display:none">
+<div class="divider">or</div>
+<button class="btn-passkey" onclick="loginWithPasskey()">Login with Passkey</button>
+<div class="passkey-status" id="passkey-status"></div>
+</div>
+<div id="passkey-unavailable" style="display:none">
+<div class="divider">passkey</div>
+<div class="passkey-status">No passkeys registered yet. Log in with password first, then register a passkey from the dashboard.</div>
+</div>
+</div>
+<script>
+(async()=>{
+if(!window.PublicKeyCredential){document.getElementById('passkey-unavailable').style.display='block';
+document.getElementById('passkey-unavailable').querySelector('.passkey-status').textContent='Your browser does not support passkeys in this context. Use HTTPS or Chrome with a supported device.';return}
+try{const r=await fetch('/api/v1/auth/passkey/login-options',{method:'POST'});
+if(r.ok){document.getElementById('passkey-section').style.display='block'}
+else{document.getElementById('passkey-unavailable').style.display='block'}}
+catch(e){document.getElementById('passkey-unavailable').style.display='block'}})();
+async function loginWithPasskey(){const s=document.getElementById('passkey-status');
+try{s.textContent='Requesting passkey...';
+const optResp=await fetch('/api/v1/auth/passkey/login-options',{method:'POST'});
+if(!optResp.ok){s.textContent='No passkeys registered';return}
+const opts=await optResp.json();
+opts.challenge=_b64ToArr(opts.challenge);
+if(opts.allowCredentials)opts.allowCredentials=opts.allowCredentials.map(c=>({...c,id:_b64ToArr(c.id)}));
+const cred=await navigator.credentials.get({publicKey:opts});
+const body={id:cred.id,rawId:_arrToB64(new Uint8Array(cred.rawId)),type:cred.type,
+response:{authenticatorData:_arrToB64(new Uint8Array(cred.response.authenticatorData)),
+clientDataJSON:_arrToB64(new Uint8Array(cred.response.clientDataJSON)),
+signature:_arrToB64(new Uint8Array(cred.response.signature)),
+userHandle:cred.response.userHandle?_arrToB64(new Uint8Array(cred.response.userHandle)):null}};
+const vResp=await fetch('/api/v1/auth/passkey/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+if(vResp.ok){window.location.href='/'}else{const e=await vResp.json();s.textContent='Failed: '+(e.detail||'Unknown error')}}
+catch(e){s.textContent=e.name==='NotAllowedError'?'Cancelled':('Error: '+e.message)}}
+function _b64ToArr(b){const s=b.replace(/-/g,'+').replace(/_/g,'/');const r=atob(s);const a=new Uint8Array(r.length);for(let i=0;i<r.length;i++)a[i]=r.charCodeAt(i);return a.buffer}
+function _arrToB64(a){let s='';const b=new Uint8Array(a);for(let i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=/g,'')}
+</script>
+</body></html>"""
 
 
 @app.get("/login")
@@ -164,6 +238,162 @@ async def logout():
     response = RedirectResponse("/login", status_code=302)
     response.delete_cookie("session")
     return response
+
+
+# --- Passkey (WebAuthn) Auth ---
+
+RP_ID = os.environ.get("WEBAUTHN_RP_ID", "monitor.oneshell.in")
+RP_NAME = "AiDevOps Dashboard"
+RP_ORIGIN = os.environ.get("WEBAUTHN_ORIGIN", f"https://{RP_ID}")
+_passkey_challenges: dict[str, tuple[bytes, float]] = {}  # user_id -> (challenge, expiry)
+
+
+@app.post("/api/v1/auth/passkey/register-options")
+async def passkey_register_options(request: Request):
+    """Generate registration challenge. Must be authenticated first."""
+    if not _is_authenticated(request):
+        raise HTTPException(status_code=401, detail="Must be logged in to register a passkey")
+    try:
+        from webauthn import generate_registration_options
+        from webauthn.helpers.structs import AuthenticatorSelectionCriteria, ResidentKeyRequirement, UserVerificationRequirement
+        from webauthn.helpers import bytes_to_base64url
+
+        existing_creds = get_passkey_credentials_for_user(DASHBOARD_USER)
+        exclude = []
+        for c in existing_creds:
+            from webauthn.helpers.structs import PublicKeyCredentialDescriptor
+            exclude.append(PublicKeyCredentialDescriptor(id=c["id"].encode() if isinstance(c["id"], str) else c["id"]))
+
+        options = generate_registration_options(
+            rp_id=RP_ID,
+            rp_name=RP_NAME,
+            user_id=DASHBOARD_USER.encode(),
+            user_name=DASHBOARD_USER,
+            user_display_name=DASHBOARD_USER,
+            authenticator_selection=AuthenticatorSelectionCriteria(
+                resident_key=ResidentKeyRequirement.PREFERRED,
+                user_verification=UserVerificationRequirement.PREFERRED,
+            ),
+            exclude_credentials=exclude,
+        )
+        _passkey_challenges[DASHBOARD_USER] = (options.challenge, time.time() + 300)
+
+        from webauthn.helpers import options_to_json
+        return JSONResponse(content=json.loads(options_to_json(options)))
+    except ImportError:
+        raise HTTPException(status_code=501, detail="py-webauthn not installed")
+
+
+@app.post("/api/v1/auth/passkey/register")
+async def passkey_register(request: Request):
+    """Verify registration and store credential."""
+    if not _is_authenticated(request):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        from webauthn import verify_registration_response
+        from webauthn.helpers import base64url_to_bytes
+
+        data = await request.json()
+        challenge_data = _passkey_challenges.pop(DASHBOARD_USER, None)
+        if not challenge_data or time.time() > challenge_data[1]:
+            raise HTTPException(status_code=400, detail="Challenge expired")
+
+        verification = verify_registration_response(
+            credential=data,
+            expected_challenge=challenge_data[0],
+            expected_rp_id=RP_ID,
+            expected_origin=RP_ORIGIN,
+        )
+
+        cred_id = verification.credential_id.hex()
+        save_passkey_credential(
+            credential_id=cred_id,
+            user_id=DASHBOARD_USER,
+            public_key=verification.credential_public_key,
+            sign_count=verification.sign_count,
+        )
+        return {"status": "ok", "credential_id": cred_id}
+    except ImportError:
+        raise HTTPException(status_code=501, detail="py-webauthn not installed")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/v1/auth/passkey/login-options")
+async def passkey_login_options():
+    """Generate authentication challenge."""
+    try:
+        from webauthn import generate_authentication_options
+        from webauthn.helpers.structs import PublicKeyCredentialDescriptor, UserVerificationRequirement
+
+        creds = get_passkey_credentials_for_user(DASHBOARD_USER)
+        allow = []
+        for c in creds:
+            allow.append(PublicKeyCredentialDescriptor(id=bytes.fromhex(c["id"])))
+
+        if not allow:
+            raise HTTPException(status_code=404, detail="No passkeys registered")
+
+        options = generate_authentication_options(
+            rp_id=RP_ID,
+            allow_credentials=allow,
+            user_verification=UserVerificationRequirement.PREFERRED,
+        )
+        _passkey_challenges["__login__"] = (options.challenge, time.time() + 300)
+
+        from webauthn.helpers import options_to_json
+        return JSONResponse(content=json.loads(options_to_json(options)))
+    except ImportError:
+        raise HTTPException(status_code=501, detail="py-webauthn not installed")
+
+
+@app.post("/api/v1/auth/passkey/login")
+async def passkey_login(request: Request):
+    """Verify passkey assertion and create session."""
+    try:
+        from webauthn import verify_authentication_response
+
+        data = await request.json()
+        challenge_data = _passkey_challenges.pop("__login__", None)
+        if not challenge_data or time.time() > challenge_data[1]:
+            raise HTTPException(status_code=400, detail="Challenge expired")
+
+        raw_id_hex = data.get("rawId", data.get("id", ""))
+        # Try to find credential
+        cred = get_passkey_credential(raw_id_hex)
+        if not cred:
+            # Try base64url decode
+            from webauthn.helpers import base64url_to_bytes
+            try:
+                decoded = base64url_to_bytes(raw_id_hex).hex()
+                cred = get_passkey_credential(decoded)
+            except Exception:
+                pass
+        if not cred:
+            raise HTTPException(status_code=400, detail="Unknown credential")
+
+        verification = verify_authentication_response(
+            credential=data,
+            expected_challenge=challenge_data[0],
+            expected_rp_id=RP_ID,
+            expected_origin=RP_ORIGIN,
+            credential_public_key=cred["public_key"],
+            credential_current_sign_count=cred["sign_count"],
+        )
+
+        update_passkey_sign_count(cred["id"], verification.new_sign_count)
+
+        expires = time.time() + SESSION_MAX_AGE
+        token = _sign_session(f"{DASHBOARD_USER}|{expires}")
+        response = JSONResponse(content={"status": "ok"})
+        response.set_cookie("session", token, max_age=SESSION_MAX_AGE, httponly=True, samesite="lax")
+        return response
+    except ImportError:
+        raise HTTPException(status_code=501, detail="py-webauthn not installed")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # --- Health ---
@@ -266,10 +496,23 @@ async def get_service_logs(service: str, namespace: str = "default", tail: int =
 
 @app.get("/api/v1/services", dependencies=[Depends(verify_api_key)])
 async def list_services():
+    from devops import k8s_client
+
+    # Get pod metrics for resource usage
+    pod_metrics = {}
+    for ns in ["default", "pos"]:
+        try:
+            raw = await k8s_client.get_top_pods(ns)
+            for p in raw:
+                # Match pod name to service (pod names start with deployment name)
+                pod_metrics[p.get("name", "")] = p
+        except Exception:
+            pass
+
     services = []
     for name, info in SERVICE_TOPOLOGY.items():
         health = service_health_monitor.services.get(name)
-        services.append({
+        svc = {
             "name": name,
             "namespace": info.namespace,
             "port": info.port,
@@ -278,7 +521,19 @@ async def list_services():
             "status": health.status.value if health else "unknown",
             "response_time_ms": health.response_time_ms if health else None,
             "error": health.error if health else None,
-        })
+            "cpu_millicores": 0,
+            "memory_mib": 0,
+        }
+        # Find matching pod metrics
+        deploy_name = name.lower().replace("-", "")
+        for pod_name, metrics in pod_metrics.items():
+            if pod_name.startswith(deploy_name):
+                cpu_str = metrics.get("cpu", "0m")
+                mem_str = metrics.get("memory", "0Mi")
+                svc["cpu_millicores"] = int(cpu_str.rstrip("m")) if cpu_str.endswith("m") else 0
+                svc["memory_mib"] = int(mem_str.rstrip("Mi")) if mem_str.endswith("Mi") else 0
+                break
+        services.append(svc)
     return services
 
 
@@ -299,6 +554,99 @@ async def mongo_health():
 async def mongo_connections():
     from devops import mongodb_client
     return await mongodb_client.get_connection_pool()
+
+
+@app.get("/api/v1/mongodb/replicas", dependencies=[Depends(verify_api_key)])
+async def mongo_replicas():
+    """Get MongoDB replica set health for all replica sets."""
+    from devops import k8s_client
+    results = []
+    for rs_name in ["rs0"]:
+        # Get replica set members by checking pods
+        pods_raw = await k8s_client._run_kubectl(
+            "get", "pods", "-n", "mongodb", "-l", f"app.kubernetes.io/replset={rs_name}",
+            "-o", "jsonpath={range .items[*]}{.metadata.name}|{.status.phase}|{.status.podIP}|{.status.conditions[?(@.type=='Ready')].status}{\"\\n\"}{end}",
+        )
+        members = []
+        for line in (pods_raw or "").strip().splitlines():
+            parts = line.split("|")
+            if len(parts) >= 4:
+                members.append({
+                    "name": parts[0],
+                    "phase": parts[1],
+                    "ip": parts[2],
+                    "ready": parts[3] == "True",
+                })
+        # Get rs.status() from one running member
+        # Get rs.status() + serverStatus() for memory, connections, opcounters per member
+        rs_detail_raw = await k8s_client._run_kubectl(
+            "exec", "-n", "mongodb", "prod-cluster-mongos-0",
+            "--", "mongosh",
+            "mongodb://clusterAdmin:tb3GSgY6U5ZSc7CNsvf6@prod-cluster-rs0-0.prod-cluster-rs0.mongodb.svc.cluster.local:27017/admin?authSource=admin&replicaSet=rs0",
+            "--quiet", "--eval",
+            """
+            const rss = rs.status();
+            const ss = db.serverStatus();
+            const mem = ss.mem || {};
+            const conns = ss.connections || {};
+            const ops = ss.opcounters || {};
+            const wt = ss.wiredTiger?.cache || {};
+            const N = v => Number(v) || 0;
+            JSON.stringify({
+              members: rss.members.map(m => ({name: m.name, state: m.stateStr, health: m.health, uptime: m.uptime, optimeDate: m.optimeDate})),
+              serverStatus: {
+                host: ss.host,
+                uptimeSeconds: N(ss.uptime),
+                memResident: N(mem.resident),
+                memVirtual: N(mem.virtual),
+                connsCurrent: N(conns.current),
+                connsAvailable: N(conns.available),
+                connsTotalCreated: N(conns.totalCreated),
+                opsInsert: N(ops.insert),
+                opsQuery: N(ops.query),
+                opsUpdate: N(ops.update),
+                opsDelete: N(ops.delete),
+                opsGetmore: N(ops.getmore),
+                opsCommand: N(ops.command),
+                cacheUsedBytes: N(wt['bytes currently in the cache']),
+                cacheMaxBytes: N(wt['maximum bytes configured']),
+                cacheDirtyBytes: N(wt['tracked dirty bytes in the cache']),
+                replicationLag: rss.members.filter(m => m.stateStr !== 'PRIMARY').map(m => {
+                  const primary = rss.members.find(p => p.stateStr === 'PRIMARY');
+                  return {name: m.name, lagSeconds: primary ? Math.round((primary.optimeDate - m.optimeDate) / 1000) : null};
+                })
+              }
+            });
+            """,
+        )
+        rs_members = []
+        server_status = {}
+        try:
+            import json as j
+            parsed = j.loads(rs_detail_raw) if rs_detail_raw else {}
+            rs_members = parsed.get("members", [])
+            server_status = parsed.get("serverStatus", {})
+        except Exception:
+            pass
+        results.append({
+            "name": rs_name,
+            "pods": members,
+            "rs_members": rs_members,
+            "server_status": server_status,
+            "member_count": len(members),
+        })
+    # Also check config servers
+    cfg_pods_raw = await k8s_client._run_kubectl(
+        "get", "pods", "-n", "mongodb", "-l", "app.kubernetes.io/replset=cfg",
+        "-o", "jsonpath={range .items[*]}{.metadata.name}|{.status.phase}|{.status.conditions[?(@.type=='Ready')].status}{\"\\n\"}{end}",
+    )
+    cfg_members = []
+    for line in (cfg_pods_raw or "").strip().splitlines():
+        parts = line.split("|")
+        if len(parts) >= 3:
+            cfg_members.append({"name": parts[0], "phase": parts[1], "ready": parts[2] == "True"})
+    results.append({"name": "cfg", "pods": cfg_members, "rs_members": [], "member_count": len(cfg_members)})
+    return results
 
 
 @app.get("/api/v1/mongodb/sync-errors", dependencies=[Depends(verify_api_key)])
@@ -844,7 +1192,7 @@ async def incident_postmortem(incident_id: str):
 
 @app.get("/api/v1/openobserve/status", dependencies=[Depends(verify_api_key)])
 async def openobserve_status():
-    return {"status": "not_configured", "message": "OpenObserve not connected"}
+    return {"healthy": False, "status": "not_configured", "message": "OpenObserve integration not configured. Set OPENOBSERVE_URL in .env to enable.", "recent_error_count": 0}
 
 
 @app.get("/api/v1/openobserve/errors/{service}", dependencies=[Depends(verify_api_key)])
@@ -1198,6 +1546,42 @@ async def restart_debezium(connector: str):
     return {"result": raw}
 
 
+# --- Harbor ---
+
+@app.get("/api/v1/harbor/health", dependencies=[Depends(verify_api_key)])
+async def harbor_health():
+    """Check Harbor container registry health at docker.oneshell.in."""
+    from devops import k8s_client
+    exec_pods = await k8s_client.list_pods("default")
+    exec_pod = next(
+        (p["name"] for p in exec_pods
+         if p["status"] == "Running" and p["name"].startswith("nginx")),
+        None,
+    )
+    if not exec_pod:
+        return {"status": "unknown", "error": "No exec pod available"}
+
+    raw = await k8s_client.exec_in_pod(
+        exec_pod, "default",
+        ["curl", "-sk", "--max-time", "8", "https://docker.oneshell.in/api/v2.0/health"],
+        timeout=15,
+    )
+    if not raw:
+        return {"status": "critical", "error": "Harbor unreachable"}
+
+    try:
+        data = json.loads(raw)
+        components = data.get("components", [])
+        unhealthy = [c for c in components if c.get("status", "").lower() != "healthy"]
+        return {
+            "status": "critical" if unhealthy else "healthy",
+            "components": components,
+            "unhealthy": [c["name"] for c in unhealthy] if unhealthy else [],
+        }
+    except (json.JSONDecodeError, KeyError):
+        return {"status": "degraded", "raw": raw[:500]}
+
+
 # --- Certificates ---
 # Monitors the oneshell-credential TLS secret in default namespace.
 # This is a manually-managed cert (not cert-manager), created via:
@@ -1284,16 +1668,54 @@ async def _parse_tls_secret(secret_name: str, namespace: str) -> dict:
     return result
 
 
+_CERT_SECRETS = [
+    {"name": "oneshell-credential", "namespace": "default"},
+    {"name": "oneshellsolutions-tls", "namespace": "default"},
+]
+
+
 @app.get("/api/v1/certificates", dependencies=[Depends(verify_api_key)])
 async def list_certificates():
-    cert = await _parse_tls_secret(_CERT_SECRET_NAME, _CERT_SECRET_NAMESPACE)
-    return [cert]
+    certs = await asyncio.gather(*[
+        _parse_tls_secret(c["name"], c["namespace"]) for c in _CERT_SECRETS
+    ])
+    # Also check cert-manager certificates if any
+    from devops import k8s_client
+    cm_raw = await k8s_client._run_kubectl(
+        "get", "certificates", "-A",
+        "-o", "jsonpath={range .items[*]}{.metadata.name}|{.metadata.namespace}|{.status.conditions[0].status}|{.status.notAfter}{\"\\n\"}{end}",
+    )
+    for line in (cm_raw or "").strip().splitlines():
+        parts = line.split("|")
+        if len(parts) >= 4 and not any(c.get("name") == parts[0] for c in certs):
+            days_rem = None
+            expired = False
+            expiring_soon = False
+            if parts[3]:
+                try:
+                    from datetime import datetime as dt
+                    exp = dt.fromisoformat(parts[3].replace("Z", "+00:00"))
+                    now = dt.utcnow().replace(tzinfo=exp.tzinfo)
+                    days_rem = (exp - now).days
+                    expired = days_rem < 0
+                    expiring_soon = 0 <= days_rem <= 14
+                except Exception:
+                    pass
+            certs.append({
+                "name": parts[0], "namespace": parts[1],
+                "type": "cert-manager", "ready": parts[2] == "True",
+                "not_after": parts[3], "days_remaining": days_rem,
+                "expired": expired, "expiring_soon": expiring_soon,
+            })
+    return list(certs)
 
 
 @app.get("/api/v1/certificates/status", dependencies=[Depends(verify_api_key)])
 async def certificate_status():
-    cert = await _parse_tls_secret(_CERT_SECRET_NAME, _CERT_SECRET_NAMESPACE)
-    return cert
+    certs = await asyncio.gather(*[
+        _parse_tls_secret(c["name"], c["namespace"]) for c in _CERT_SECRETS
+    ])
+    return list(certs)
 
 
 @app.post("/api/v1/certificates/{name}/renew", dependencies=[Depends(verify_api_key)])
@@ -1395,10 +1817,44 @@ async def logmonitor_scan():
     return result
 
 
+@app.get("/api/v1/logmonitor/latest", dependencies=[Depends(verify_api_key)])
+async def logmonitor_latest():
+    """Get the latest auto-scan result (cached, no new scan triggered)."""
+    result = lm_get_last_scan()
+    if result:
+        return result
+    # No cached result yet, trigger a scan
+    return await lm_scan_all()
+
+
+@app.post("/api/v1/logmonitor/autoscan", dependencies=[Depends(verify_api_key)])
+async def logmonitor_autoscan_control(request: Request):
+    """Control auto-scan: POST {enabled: true/false, interval: 300}."""
+    data = await request.json()
+    if data.get("enabled", True):
+        interval = data.get("interval", 300)
+        lm_start_auto_scan(dispatch_fn=_dispatch_to_clawdbot, interval_seconds=interval)
+        return {"status": "started", "interval": interval}
+    else:
+        lm_stop_auto_scan()
+        return {"status": "stopped"}
+
+
 @app.get("/api/v1/logmonitor/tickets", dependencies=[Depends(verify_api_key)])
-async def logmonitor_tickets():
-    """Get all log monitor tickets."""
-    return lm_get_tickets()
+async def logmonitor_tickets(
+    status: str | None = None,
+    service: str | None = None,
+    severity: str | None = None,
+    limit: int = 50,
+):
+    """Get log monitor tickets with optional filters."""
+    return lm_get_tickets(status=status, service=service, severity=severity, limit=limit)
+
+
+@app.get("/api/v1/logmonitor/ticket-stats", dependencies=[Depends(verify_api_key)])
+async def logmonitor_ticket_stats():
+    """Get ticket statistics for dashboard overview."""
+    return get_ticket_stats()
 
 
 @app.post("/api/v1/logmonitor/ticket", dependencies=[Depends(verify_api_key)])
@@ -1419,6 +1875,26 @@ async def logmonitor_create_ticket(request: Request):
     asyncio.create_task(_dispatch_to_clawdbot(ticket))
 
     return {"ticket": ticket}
+
+
+@app.put("/api/v1/logmonitor/tickets/{ticket_id}", dependencies=[Depends(verify_api_key)])
+async def logmonitor_update_ticket(ticket_id: int, request: Request):
+    """Update a ticket status or fields."""
+    data = await request.json()
+    updated = lm_update_ticket(ticket_id, data)
+    if not updated:
+        raise HTTPException(404, "Ticket not found")
+    return updated
+
+
+@app.post("/api/v1/logmonitor/tickets/{ticket_id}/ai-fix", dependencies=[Depends(verify_api_key)])
+async def logmonitor_ai_fix_ticket(ticket_id: int):
+    """Dispatch a ticket to ClawdBot for AI fix."""
+    ticket = lm_get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+    asyncio.create_task(_dispatch_to_clawdbot(ticket))
+    return {"status": "dispatched", "ticket_id": ticket_id}
 
 
 @app.post("/api/v1/logmonitor/diagnose", dependencies=[Depends(verify_api_key)])
@@ -1455,8 +1931,6 @@ async def logmonitor_diagnose(request: Request):
 
 async def _dispatch_to_clawdbot(ticket: dict):
     """Dispatch a ticket to ClawdBot for investigation and fix."""
-    import aiohttp
-
     ticket_id = ticket["id"]
     lm_update_ticket(ticket_id, {"status": "investigating"})
 
@@ -1541,13 +2015,15 @@ async def _notify_telegram(ticket: dict):
         text += f"\nOutput (truncated):\n{ticket['clawdbot_output'][:500]}"
 
     try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            await session.post(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            )
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            data=json.dumps({"chat_id": chat_id, "text": text}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=10))
     except Exception as e:
         logger.error("Telegram notification failed: %s", e)
 
