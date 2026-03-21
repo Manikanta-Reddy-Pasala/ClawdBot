@@ -8,7 +8,6 @@ function renderServiceTopology(containerId, topology) {
     if (!container || !topology) return;
 
     container.innerHTML = '';
-    const width = container.clientWidth || 1200;
 
     const services = topology.services || [];
     const edges = topology.edges || [];
@@ -50,10 +49,13 @@ function renderServiceTopology(containerId, topology) {
     });
 
     // --- Layout constants ---
-    const nodeW = 150, nodeH = 56;
-    const layerPadY = 28, layerPadX = 24;
-    const gapX = 24, gapY = 16;
-    const layerGap = 20;
+    const nodeW = 136, nodeH = 50;
+    const layerPadY = 22, layerPadX = 16;
+    const gapX = 14, gapY = 12;
+    const layerGap = 16;
+
+    // Use full viewport width for topology
+    const width = Math.max(window.innerWidth - 20, 1400);
 
     const namespaceColors = {
         'default': { bg: 'rgba(99,102,241,0.06)', border: 'rgba(99,102,241,0.25)', text: '#818cf8' },
@@ -76,6 +78,48 @@ function renderServiceTopology(containerId, topology) {
         infra: 'Infrastructure',
     };
 
+    // --- Helper: lay out nodes in a namespace group, wrapping rows ---
+    function layoutNsGroup(items, startX, startY, maxWidth) {
+        const rows = [];
+        let row = [];
+        let rowW = layerPadX;
+
+        items.forEach(node => {
+            const needed = nodeW + gapX;
+            if (row.length > 0 && rowW + needed > maxWidth - layerPadX) {
+                rows.push(row);
+                row = [];
+                rowW = layerPadX;
+            }
+            row.push(node);
+            rowW += needed;
+        });
+        if (row.length) rows.push(row);
+
+        const rowH = nodeH + gapY;
+        const groupH = rows.length * rowH - gapY + layerPadY * 2;
+
+        // Widest row determines group width
+        let maxRowW = 0;
+        rows.forEach(r => {
+            const w = r.length * (nodeW + gapX) - gapX;
+            if (w > maxRowW) maxRowW = w;
+        });
+        const groupW = maxRowW + layerPadX * 2;
+
+        // Position each node
+        rows.forEach((r, ri) => {
+            const rowWidth = r.length * (nodeW + gapX) - gapX;
+            const rowStartX = startX + layerPadX + (maxRowW - rowWidth) / 2;
+            r.forEach((node, ci) => {
+                node.x = rowStartX + ci * (nodeW + gapX) + nodeW / 2;
+                node.y = startY + layerPadY + ri * rowH + nodeH / 2;
+            });
+        });
+
+        return { groupW, groupH };
+    }
+
     // --- Compute positions ---
     let currentY = 20;
     const layerBounds = {};
@@ -92,48 +136,111 @@ function renderServiceTopology(containerId, topology) {
             nsByNs[ns].push(n);
         });
 
-        const layerStartY = currentY;
-        let maxRowH = 0;
-
-        // Lay out each namespace group side by side
-        let nsX = layerPadX;
         const nsGroups = Object.entries(nsByNs);
 
-        // Calculate total width needed
-        let totalNeeded = 0;
+        // Determine available width for this layer's namespace groups
+        const availW = width - 40;
+
+        // Check if all groups can fit side by side in single rows
+        let totalSingleRowW = 0;
         nsGroups.forEach(([, items]) => {
-            totalNeeded += items.length * (nodeW + gapX) - gapX + layerPadX * 2;
+            totalSingleRowW += items.length * (nodeW + gapX) - gapX + layerPadX * 2;
         });
-        totalNeeded += (nsGroups.length - 1) * gapX;
+        totalSingleRowW += (nsGroups.length - 1) * gapX;
+        const allFitSingleRow = totalSingleRowW <= availW;
 
-        // Center all namespace groups
-        const startX = Math.max(layerPadX, (width - totalNeeded) / 2);
-        nsX = startX;
-
-        nsGroups.forEach(([ns, items]) => {
-            const groupW = items.length * (nodeW + gapX) - gapX + layerPadX * 2;
-            const groupH = nodeH + layerPadY * 2;
-
-            items.forEach((node, i) => {
-                node.x = nsX + layerPadX + i * (nodeW + gapX) + nodeW / 2;
-                node.y = currentY + layerPadY + nodeH / 2;
-                node._ns = ns;
-                node._groupX = nsX;
-                node._groupW = groupW;
-                node._groupY = currentY;
-                node._groupH = groupH;
+        const groupSizes = [];
+        if (allFitSingleRow) {
+            // All fit in single rows side by side
+            nsGroups.forEach(([ns, items]) => {
+                const maxGroupW = items.length * (nodeW + gapX) - gapX + layerPadX * 2;
+                const sz = layoutNsGroup(items, 0, 0, maxGroupW);
+                groupSizes.push({ ns, items, ...sz });
             });
+        } else {
+            // Too many — merge all into one flat layout, draw ns backgrounds after
+            const allItems = [];
+            nsGroups.forEach(([ns, items]) => items.forEach(n => { n._ns = ns; allItems.push(n); }));
+            // Sort: default namespace first
+            allItems.sort((a, b) => (a._ns === 'default' ? 0 : 1) - (b._ns === 'default' ? 0 : 1));
+            layoutNsGroup(allItems, 0, 0, availW);
+            // Create a single "merged" group
+            groupSizes.push({ ns: '_merged', items: allItems, groupW: availW, groupH: 0 });
+        }
 
-            nsX += groupW + gapX;
-            maxRowH = Math.max(maxRowH, groupH);
+        // Total width of all groups
+        let totalGroupW = 0;
+        groupSizes.forEach(g => totalGroupW += g.groupW);
+        totalGroupW += (groupSizes.length - 1) * gapX;
+
+        // Center groups
+        let nsX = Math.max(layerPadX, (width - totalGroupW) / 2);
+
+        let maxGroupH = 0;
+        groupSizes.forEach((g) => {
+            const { ns, items, groupW } = g;
+
+            // Re-layout at the actual position (add padding so wrapping matches first pass)
+            const sz = layoutNsGroup(items, nsX, currentY, groupW + layerPadX * 2);
+
+            if (ns === '_merged') {
+                // For merged layout, compute bounding box per actual namespace
+                const nsBounds = {};
+                items.forEach(node => {
+                    const actualNs = node._ns || node.namespace || 'default';
+                    node._ns = actualNs;
+                    if (!nsBounds[actualNs]) {
+                        nsBounds[actualNs] = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
+                    }
+                    const b = nsBounds[actualNs];
+                    b.minX = Math.min(b.minX, node.x - nodeW / 2);
+                    b.maxX = Math.max(b.maxX, node.x + nodeW / 2);
+                    b.minY = Math.min(b.minY, node.y - nodeH / 2);
+                    b.maxY = Math.max(b.maxY, node.y + nodeH / 2);
+                });
+                // Set group bounds to full layer
+                items.forEach(node => {
+                    node._groupX = nsX;
+                    node._groupW = sz.groupW;
+                    node._groupY = currentY;
+                    node._groupH = sz.groupH;
+                    // Override with per-namespace bounds for background drawing
+                    const b = nsBounds[node._ns];
+                    if (b) {
+                        node._nsGroupX = b.minX - 8;
+                        node._nsGroupW = b.maxX - b.minX + 16;
+                        node._nsGroupY = b.minY - 8;
+                        node._nsGroupH = b.maxY - b.minY + 16;
+                    }
+                });
+                if (sz.groupH > maxGroupH) maxGroupH = sz.groupH;
+            } else {
+                items.forEach(node => {
+                    if (!node._ns) node._ns = ns;
+                    node._groupX = nsX;
+                    node._groupW = sz.groupW;
+                    node._groupY = currentY;
+                    node._groupH = sz.groupH;
+                });
+                if (sz.groupH > maxGroupH) maxGroupH = sz.groupH;
+            }
+
+            nsX += sz.groupW + gapX;
+        });
+
+        // Make all groups in this layer the same height
+        groupSizes.forEach(g => {
+            g.items.forEach(node => {
+                node._groupH = maxGroupH;
+            });
         });
 
         layerBounds[layerName] = {
-            y: layerStartY,
-            h: maxRowH,
+            y: currentY,
+            h: maxGroupH,
             label: layerLabels[layerName],
         };
-        currentY += maxRowH + layerGap;
+        currentY += maxGroupH + layerGap;
     });
 
     const totalHeight = currentY + 20;
@@ -141,9 +248,10 @@ function renderServiceTopology(containerId, topology) {
     // --- Create SVG ---
     const svg = d3.select(`#${containerId}`)
         .append('svg')
-        .attr('width', width)
+        .attr('width', '100%')
         .attr('height', totalHeight)
-        .attr('viewBox', `0 0 ${width} ${totalHeight}`);
+        .attr('viewBox', `0 0 ${width} ${totalHeight}`)
+        .attr('preserveAspectRatio', 'xMidYMin meet');
 
     // --- Defs: arrow markers, glow filter ---
     const defs = svg.append('defs');
@@ -192,14 +300,20 @@ function renderServiceTopology(containerId, topology) {
     services.forEach(s => {
         const node = nodeMap[s.name];
         if (!node || !node._groupX) return;
-        const key = `${node._groupX}-${node._groupY}`;
+
+        // Use per-namespace bounds if available (merged layout), otherwise group bounds
+        const gx = node._nsGroupX !== undefined ? node._nsGroupX : node._groupX;
+        const gy = node._nsGroupY !== undefined ? node._nsGroupY : node._groupY;
+        const gw = node._nsGroupW !== undefined ? node._nsGroupW : node._groupW;
+        const gh = node._nsGroupH !== undefined ? node._nsGroupH : node._groupH;
+        const key = `${node._ns}-${Math.round(gx)}-${Math.round(gy)}`;
         if (drawnGroups.has(key)) return;
         drawnGroups.add(key);
 
         const nsColor = namespaceColors[node._ns] || namespaceColors.default;
         svg.append('rect')
-            .attr('x', node._groupX).attr('y', node._groupY + 2)
-            .attr('width', node._groupW).attr('height', node._groupH - 4)
+            .attr('x', gx).attr('y', gy)
+            .attr('width', gw).attr('height', gh)
             .attr('rx', 6)
             .attr('fill', nsColor.bg)
             .attr('stroke', nsColor.border)
@@ -208,8 +322,8 @@ function renderServiceTopology(containerId, topology) {
 
         // Namespace label (bottom-right)
         svg.append('text')
-            .attr('x', node._groupX + node._groupW - 6)
-            .attr('y', node._groupY + node._groupH - 8)
+            .attr('x', gx + gw - 6)
+            .attr('y', gy + gh - 4)
             .attr('text-anchor', 'end')
             .attr('fill', nsColor.text)
             .attr('font-size', '9px')
@@ -225,7 +339,6 @@ function renderServiceTopology(containerId, topology) {
         const tgt = nodeMap[e.to];
         if (!src || !tgt || !src.x || !tgt.x) return;
 
-        // Determine which tier color to use (source tier)
         const edgeTier = src.tier || 'standard';
 
         // Curved path from source bottom to target top
@@ -273,23 +386,23 @@ function renderServiceTopology(containerId, topology) {
 
         // Tier indicator dot
         g.append('circle')
-            .attr('cx', -nodeW / 2 + 12).attr('cy', -nodeH / 2 + 12)
-            .attr('r', 4)
+            .attr('cx', -nodeW / 2 + 10).attr('cy', -nodeH / 2 + 10)
+            .attr('r', 3.5)
             .attr('fill', color);
 
         // Service name
-        const displayName = s.name.length > 20 ? s.name.substring(0, 18) + '..' : s.name;
+        const displayName = s.name.length > 18 ? s.name.substring(0, 16) + '..' : s.name;
         g.append('text')
-            .attr('x', 0).attr('y', -4)
+            .attr('x', 0).attr('y', -3)
             .attr('text-anchor', 'middle')
             .attr('fill', '#e1e4ea')
-            .attr('font-size', '11px')
+            .attr('font-size', '10.5px')
             .attr('font-weight', '600')
             .text(displayName);
 
         // Port + tier label
         g.append('text')
-            .attr('x', 0).attr('y', 14)
+            .attr('x', 0).attr('y', 12)
             .attr('text-anchor', 'middle')
             .attr('fill', 'rgba(255,255,255,0.4)')
             .attr('font-size', '9px')
@@ -306,7 +419,6 @@ function renderServiceTopology(containerId, topology) {
                 .transition().duration(150)
                 .attr('stroke-opacity', 1)
                 .attr('fill', 'rgba(40,42,56,0.98)');
-            // Highlight connected edges
             highlightEdges(s.name, true);
         })
         .on('mouseout', function () {
@@ -321,8 +433,6 @@ function renderServiceTopology(containerId, topology) {
     function highlightEdges(serviceName, highlight) {
         linkG.selectAll('path').each(function () {
             const path = d3.select(this);
-            const d = path.attr('d');
-            // Check if this edge involves the service
             const src = edges.find(e => {
                 const sNode = nodeMap[e.from];
                 const tNode = nodeMap[e.to];
@@ -338,19 +448,19 @@ function renderServiceTopology(containerId, topology) {
 
     // --- Legend ---
     const legendG = svg.append('g')
-        .attr('transform', `translate(${width - 220}, ${totalHeight - 80})`);
+        .attr('transform', `translate(${width - 220}, ${totalHeight - 70})`);
 
     legendG.append('rect')
         .attr('x', -8).attr('y', -8)
-        .attr('width', 210).attr('height', 72)
+        .attr('width', 210).attr('height', 66)
         .attr('rx', 6)
         .attr('fill', 'rgba(30,32,44,0.9)')
         .attr('stroke', 'rgba(255,255,255,0.1)');
 
     [
         { label: 'Critical', color: tierColors.critical, y: 8 },
-        { label: 'Important', color: tierColors.important, y: 26 },
-        { label: 'Standard', color: tierColors.standard, y: 44 },
+        { label: 'Important', color: tierColors.important, y: 24 },
+        { label: 'Standard', color: tierColors.standard, y: 40 },
     ].forEach(item => {
         legendG.append('circle').attr('cx', 8).attr('cy', item.y).attr('r', 5).attr('fill', item.color);
         legendG.append('text').attr('x', 20).attr('y', item.y + 4).attr('fill', '#aaa').attr('font-size', '10px').text(item.label);
