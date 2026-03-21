@@ -2035,9 +2035,6 @@ async def _notify_telegram(ticket: dict):
 
 # --- Admin Tasks ---
 
-ONESHELL_API_BASE = os.getenv("ONESHELL_API_BASE", "https://api.oneshell.in")
-
-
 @app.get("/api/v1/admin/search-businesses", dependencies=[Depends(verify_api_key)])
 async def admin_search_businesses(q: str = ""):
     """Search businesses by name for autocomplete via mongosh."""
@@ -2054,22 +2051,35 @@ async def admin_search_businesses(q: str = ""):
 
 @app.post("/api/v1/admin/copy-categories", dependencies=[Depends(verify_api_key)])
 async def admin_copy_categories(request: Request):
-    """Copy categories to a destination business."""
+    """Copy categories to a destination business via internal K8s service."""
     body = await request.json()
     business_id = body.get("businessId")
     business_city = body.get("businessCity")
     if not business_id or not business_city:
         raise HTTPException(400, "businessId and businessCity are required")
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{ONESHELL_API_BASE}/v1/admin/updateCategories",
-                json={"businessCity": business_city, "businessId": business_id},
-            )
-        if resp.status_code == 200:
-            return {"success": True, "result": resp.json() if resp.text else {}}
-        return {"success": False, "error": f"API returned {resp.status_code}: {resp.text[:500]}"}
+        from devops import k8s_client
+        payload = json.dumps({"businessCity": business_city, "businessId": business_id})
+        result = await k8s_client.exec_in_pod(
+            "prod-cluster-mongos-0", "mongodb",
+            ["curl", "-s", "-w", "\n%{http_code}", "-X", "POST",
+             "-H", "Content-Type: application/json",
+             "-d", payload,
+             "http://businessservice.default.svc.cluster.local:8092/v1/admin/updateCategories"],
+            timeout=30,
+        )
+        lines = result.strip().rsplit("\n", 1)
+        response_body = lines[0] if len(lines) > 1 else result
+        status_code = int(lines[-1]) if len(lines) > 1 and lines[-1].isdigit() else 0
+        if 200 <= status_code < 300:
+            try:
+                data = json.loads(response_body)
+                if isinstance(data, dict) and data.get("success") is False:
+                    return {"success": False, "error": data.get("errorMessage", "Operation failed")}
+                return {"success": True, "result": data}
+            except (json.JSONDecodeError, TypeError):
+                return {"success": True, "result": response_body}
+        return {"success": False, "error": f"API returned {status_code}: {response_body[:500]}"}
     except Exception as e:
         logger.error("Copy categories failed: %s", e)
         return {"success": False, "error": str(e)}
