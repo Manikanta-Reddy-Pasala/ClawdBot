@@ -48,6 +48,7 @@ from devops.log_monitor import (
 from devops.ticket_db import (
     init_db as init_ticket_db,
     cleanup_old_tickets,
+    reset_all_tickets,
     get_ticket_stats,
     save_passkey_credential,
     get_passkey_credential,
@@ -83,9 +84,9 @@ async def _on_startup():
     _cleanup_scheduler.add_job(cleanup_old_tickets, "interval", hours=24)
     _cleanup_scheduler.start()
 
-    # Start auto-scan loop (every 5 min), auto-creates tickets for CRITICAL issues
-    lm_start_auto_scan(dispatch_fn=_dispatch_to_clawdbot, interval_seconds=300)
-    logger.info("Log monitor auto-scan started")
+    # Auto-scan disabled - use "Scan Now" button in Log Monitor tab
+    # lm_start_auto_scan(dispatch_fn=None, interval_seconds=300)
+    logger.info("Log monitor ready (manual scan mode)")
 
 
 # --- Auth ---
@@ -1833,7 +1834,7 @@ async def logmonitor_autoscan_control(request: Request):
     data = await request.json()
     if data.get("enabled", True):
         interval = data.get("interval", 300)
-        lm_start_auto_scan(dispatch_fn=_dispatch_to_clawdbot, interval_seconds=interval)
+        lm_start_auto_scan(dispatch_fn=None, interval_seconds=interval)
         return {"status": "started", "interval": interval}
     else:
         lm_stop_auto_scan()
@@ -1857,9 +1858,16 @@ async def logmonitor_ticket_stats():
     return get_ticket_stats()
 
 
+@app.delete("/api/v1/logmonitor/tickets", dependencies=[Depends(verify_api_key)])
+async def logmonitor_reset_tickets():
+    """Delete all tickets (reset)."""
+    deleted = reset_all_tickets()
+    return {"deleted": deleted, "status": "reset"}
+
+
 @app.post("/api/v1/logmonitor/ticket", dependencies=[Depends(verify_api_key)])
 async def logmonitor_create_ticket(request: Request):
-    """Create a ticket and dispatch to ClawdBot for auto-fix."""
+    """Create a ticket. AI fix is manual via the 'Fix via AI' button."""
     data = await request.json()
     ticket = lm_create_ticket(
         service=data["service"],
@@ -1870,9 +1878,6 @@ async def logmonitor_create_ticket(request: Request):
         matched_line=data.get("matched_line", ""),
         recommendation=data.get("recommendation", ""),
     )
-
-    # Dispatch to ClawdBot via the internal task mechanism
-    asyncio.create_task(_dispatch_to_clawdbot(ticket))
 
     return {"ticket": ticket}
 
@@ -2026,6 +2031,60 @@ async def _notify_telegram(ticket: dict):
         await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=10))
     except Exception as e:
         logger.error("Telegram notification failed: %s", e)
+
+
+# --- Admin Tasks ---
+
+ONESHELL_API_BASE = os.getenv("ONESHELL_API_BASE", "https://api.oneshell.in")
+MONGODBSERVICE_URL = os.getenv("MONGODBSERVICE_URL", "http://mongodbservice.default.svc.cluster.local:8080")
+
+
+@app.get("/api/v1/admin/search-businesses", dependencies=[Depends(verify_api_key)])
+async def admin_search_businesses(q: str = ""):
+    """Search businesses by name for autocomplete."""
+    if len(q.strip()) < 2:
+        return {"businesses": []}
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{MONGODBSERVICE_URL}/v1/core/db/business-profile/get",
+                json={"keyword": q.strip(), "pageSize": 10, "pageNumber": 1},
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            businesses = data if isinstance(data, list) else data.get("data", [])
+            return {"businesses": [
+                {"businessId": b.get("businessId", ""), "businessName": b.get("businessName", ""), "businessCity": b.get("businessCity", "")}
+                for b in businesses
+            ]}
+        return {"businesses": [], "error": f"MongoDbService returned {resp.status_code}"}
+    except Exception as e:
+        logger.error("Business search failed: %s", e)
+        return {"businesses": [], "error": str(e)}
+
+
+@app.post("/api/v1/admin/copy-categories", dependencies=[Depends(verify_api_key)])
+async def admin_copy_categories(request: Request):
+    """Copy categories to a destination business."""
+    body = await request.json()
+    business_id = body.get("businessId")
+    business_city = body.get("businessCity")
+    if not business_id or not business_city:
+        raise HTTPException(400, "businessId and businessCity are required")
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{ONESHELL_API_BASE}/v1/admin/updateCategories",
+                json={"businessCity": business_city, "businessId": business_id},
+            )
+        if resp.status_code == 200:
+            return {"success": True, "result": resp.json() if resp.text else {}}
+        return {"success": False, "error": f"API returned {resp.status_code}: {resp.text[:500]}"}
+    except Exception as e:
+        logger.error("Copy categories failed: %s", e)
+        return {"success": False, "error": str(e)}
 
 
 # --- Static files (dashboard) ---

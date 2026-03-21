@@ -21,6 +21,7 @@ document.addEventListener('alpine:init', () => {
 
         // MongoDB
         mongoHealth: {},
+        mongoReplicas: [],
         syncErrors: [],
 
         // NATS
@@ -69,7 +70,6 @@ document.addEventListener('alpine:init', () => {
         // Issues
         issueCount: 0,
         issueResult: null,
-        aiFixResult: null,
         scanningIssues: false,
         fixingIssues: false,
 
@@ -104,41 +104,60 @@ document.addEventListener('alpine:init', () => {
         logMonitorAutoScan: false,
         logMonitorInterval: null,
 
+        // Tickets tab
+        ticketsList: [],
+        ticketStats: { total: 0, active: 0, by_status: {}, by_severity: {} },
+        ticketFilterStatus: '',
+        ticketFilterSeverity: '',
+        ticketFilterService: '',
+        ticketViewType: 'all', // 'all', 'devops', 'app'
+
+        // DevOps = infra/middleware (k8s, MongoDB, NATS, Redis/Dragonfly, Redpanda, certs, scheduling)
+        // Service = application-level errors (exceptions, timeouts, auth, sync logic, data conversion, HTTP errors)
+        _devopsCategories: ['Memory', 'Disk', 'Crash', 'CrashLoop', 'Image', 'Eviction', 'Probe', 'Restart',
+            'Scheduling', 'Volume', 'CPU', 'Network', 'Certificate', 'CertManager',
+            'MongoDB', 'NATS', 'NATS-DLQ', 'Redis', 'RedisLock', 'RateLimit',
+            'Redpanda', 'Debezium', 'ChangeStream', 'ConnectionPool'],
+
+        // Admin Tasks
+        adminSearch: '',
+        adminSearchResults: [],
+        adminDropdownOpen: false,
+        adminSelectedBusiness: null,
+        adminCopyLoading: false,
+        adminCopyResult: null,
+
+        // Overview AI Fix Modal
+        aiFixModal: { show: false, component: '', context: '', log: [], taskId: null, loading: false, result: null, msg: '', eventSource: null },
+
         // Charts
         statusChart: null,
         ws: null,
 
         async init() {
-            // WebSocket
             this.ws = new DashboardWebSocket(
                 (event, data) => this.handleWsMessage(event, data),
                 (connected) => { this.wsConnected = connected; }
             );
             this.ws.connect();
 
-            // Initial loads
             await this.loadOverview();
             await this.loadServices();
             this.loadDashboardCards();
+            this.loadTicketStats();
 
-            // Status doughnut chart
             this.statusChart = new ServiceStatusChart('statusChart');
             this.$nextTick(() => this.statusChart.init());
 
-            // Polling
             setInterval(() => this.loadOverview(), 15000);
             setInterval(() => this.loadServices(), 30000);
             setInterval(() => this.loadDashboardCards(), 30000);
+            setInterval(() => this.loadTicketStats(), 60000);
         },
 
         handleWsMessage(event, data) {
-            if (event === 'incident' || event === 'incident_resolved') {
-                this.loadIncidents();
-            }
-            if (event === 'service_critical') {
-                this.loadServices();
-            }
-            // fix_progress events are handled by Alpine reactivity on issue objects
+            if (event === 'incident' || event === 'incident_resolved') this.loadIncidents();
+            if (event === 'service_critical') this.loadServices();
         },
 
         async api(path, options = {}) {
@@ -157,11 +176,7 @@ document.addEventListener('alpine:init', () => {
             if (data) {
                 this.overview = data;
                 if (this.statusChart) {
-                    this.statusChart.update(
-                        data.services_healthy || 0,
-                        data.services_degraded || 0,
-                        data.services_critical || 0,
-                    );
+                    this.statusChart.update(data.services_healthy || 0, data.services_degraded || 0, data.services_critical || 0);
                 }
             }
         },
@@ -180,11 +195,9 @@ document.addEventListener('alpine:init', () => {
             if (dragonfly) this.dashDragonfly = dragonfly;
             if (redpanda) this.dashRedpanda = redpanda;
             if (nodes) this.dashNodes = nodes;
-            // Debezium summary for dashboard card
             if (debezium?.connectors?.[0]) {
                 const c = debezium.connectors[0];
-                this.dashDebezium = { state: c.state, tasks: c.tasks, failed: c.failed_tasks,
-                                       topics: debezium.connectors[0]?.task_states?.length || 0 };
+                this.dashDebezium = { state: c.state, tasks: c.tasks, failed: c.failed_tasks };
             }
         },
 
@@ -204,12 +217,8 @@ document.addEventListener('alpine:init', () => {
         },
 
         async renderTopology() {
-            if (!this.topology) {
-                this.topology = await this.api('/api/v1/services/topology');
-            }
-            if (this.topology) {
-                setTimeout(() => renderServiceTopology('topology-container', this.topology), 100);
-            }
+            if (!this.topology) this.topology = await this.api('/api/v1/services/topology');
+            if (this.topology) setTimeout(() => renderServiceTopology('topology-container', this.topology), 100);
         },
 
         async loadK8s() {
@@ -235,6 +244,12 @@ document.addEventListener('alpine:init', () => {
         async loadMongo() {
             const data = await this.api('/api/v1/mongodb/health');
             if (data) this.mongoHealth = data;
+            await this.loadMongoReplicas();
+        },
+
+        async loadMongoReplicas() {
+            const data = await this.api('/api/v1/mongodb/replicas');
+            if (data) this.mongoReplicas = data;
         },
 
         async loadSyncErrors() {
@@ -258,7 +273,6 @@ document.addEventListener('alpine:init', () => {
             this.autodetectResult = null;
             const data = await this.api('/api/v1/issues/autodetect', { method: 'POST' });
             if (data) {
-                // Add UI state to each issue
                 data.issues = (data.issues || []).map(i => ({ ...i, _fixing: false, _executing: false, _fixResult: null, _fixProgress: [], _agentLog: [], _manualCmd: '', _manualOutput: '', _aiMsg: '', _aiTaskId: null, _savingLearning: false, _learningNote: '' }));
                 this.autodetectResult = data;
             }
@@ -273,20 +287,16 @@ document.addEventListener('alpine:init', () => {
             issue._executing = false;
             issue._aiTaskId = null;
             issue._aiMsg = '';
-
-            // Start streaming AI task
             const data = await this.api('/api/v1/ai/start', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ issue: issue.detail, service: issue.service, auto_fix: true }),
             });
-
             if (!data?.task_id) {
                 issue._fixProgress.push('ERROR: Failed to start AI investigation');
                 issue._fixing = false;
                 return;
             }
-
             issue._aiTaskId = data.task_id;
             this._streamAiEvents(issue, data.task_id);
         },
@@ -294,7 +304,6 @@ document.addEventListener('alpine:init', () => {
         _streamAiEvents(issue, taskId) {
             const evtSource = new EventSource(`/api/v1/ai/stream/${taskId}`);
             issue._aiEventSource = evtSource;
-
             evtSource.onmessage = (event) => {
                 try {
                     const evt = JSON.parse(event.data);
@@ -307,21 +316,15 @@ document.addEventListener('alpine:init', () => {
                     }
                     issue._agentLog.push(evt);
                     if (issue._agentLog.length > 200) issue._agentLog.splice(0, 50);
-                    // Auto-scroll log box
                     this.$nextTick(() => {
                         const boxes = document.querySelectorAll('[x-ref="logbox"]');
                         boxes.forEach(b => { b.scrollTop = b.scrollHeight; });
                     });
-                } catch (e) {
-                    console.error('SSE parse error:', e);
-                }
+                } catch (e) { console.error('SSE parse error:', e); }
             };
-
             evtSource.onerror = () => {
                 issue._fixing = false;
-                if (!issue._fixResult) {
-                    issue._fixProgress.push('Connection lost');
-                }
+                if (!issue._fixResult) issue._fixProgress.push('Connection lost');
                 evtSource.close();
             };
         },
@@ -353,14 +356,11 @@ document.addEventListener('alpine:init', () => {
             const note = issue._learningNote || '';
             issue._agentLog.push({ type: 'status', message: 'Saving learning to memory...' });
             issue._fixing = true;
-
             await this.api(`/api/v1/ai/save-learning/${issue._aiTaskId}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ note }),
             });
-
-            // Re-open SSE stream for the save operation
             this._streamAiEvents(issue, issue._aiTaskId);
         },
 
@@ -378,12 +378,8 @@ document.addEventListener('alpine:init', () => {
 
         async runStep(issue, stepIndex, command) {
             if (!command) return;
-            // Initialize executed_steps array if needed
             if (!issue._fixResult.executed_steps) issue._fixResult.executed_steps = [];
-            // Pad array to correct index
-            while (issue._fixResult.executed_steps.length <= stepIndex) {
-                issue._fixResult.executed_steps.push(null);
-            }
+            while (issue._fixResult.executed_steps.length <= stepIndex) issue._fixResult.executed_steps.push(null);
             issue._fixResult.executed_steps[stepIndex] = { command, output: 'Running...', success: null };
             const data = await this.api('/api/v1/issues/run-step', {
                 method: 'POST',
@@ -399,7 +395,6 @@ document.addEventListener('alpine:init', () => {
         async deployService(issue) {
             const cmd = issue._fixResult?.deploy_command;
             if (!cmd) return;
-            // Extract service and namespace from deploy command
             const match = cmd.match(/deployment\/(\S+)\s+-n\s+(\S+)/);
             if (!match) { alert('Could not parse deploy command'); return; }
             const [, svc, ns] = match;
@@ -419,33 +414,24 @@ document.addEventListener('alpine:init', () => {
 
         async submitAiFix(autoExecute) {
             if (!this.aiFixError.trim()) return;
-            if (autoExecute && !confirm('AI will investigate and apply safe fixes on production. Continue?')) return;
+            if (autoExecute && !confirm('AI will investigate and apply safe fixes. Continue?')) return;
             this.aiFixLoading = true;
             this.aiFixResult = null;
             this.aiFixLog = [];
             this.aiFixMsg = '';
-
             const data = await this.api('/api/v1/analysis/ai-fix', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    error_text: this.aiFixError,
-                    service: this.aiFixService,
-                    auto_execute: autoExecute,
-                }),
+                body: JSON.stringify({ error_text: this.aiFixError, service: this.aiFixService, auto_execute: autoExecute }),
             });
-
             if (!data?.task_id) {
                 this.aiFixLoading = false;
                 this.aiFixLog.push({ type: 'error', message: 'Failed to start AI investigation' });
                 return;
             }
-
             this.aiFixTaskId = data.task_id;
-            // Open SSE stream
             const evtSource = new EventSource(`/api/v1/ai/stream/${data.task_id}`);
             this.aiFixEventSource = evtSource;
-
             evtSource.onmessage = (event) => {
                 try {
                     const evt = JSON.parse(event.data);
@@ -457,24 +443,17 @@ document.addEventListener('alpine:init', () => {
                     }
                     this.aiFixLog.push(evt);
                     if (this.aiFixLog.length > 200) this.aiFixLog.splice(0, 50);
-                } catch (e) {
-                    console.error('SSE parse error:', e);
-                }
+                } catch (e) { console.error('SSE parse error:', e); }
             };
-
             evtSource.onerror = () => {
                 this.aiFixLoading = false;
-                if (!this.aiFixResult) {
-                    this.aiFixLog.push({ type: 'error', message: 'Connection lost' });
-                }
+                if (!this.aiFixResult) this.aiFixLog.push({ type: 'error', message: 'Connection lost' });
                 evtSource.close();
             };
         },
 
         async stopAiFixPanel() {
-            if (this.aiFixTaskId) {
-                await this.api(`/api/v1/ai/stop/${this.aiFixTaskId}`, { method: 'POST' });
-            }
+            if (this.aiFixTaskId) await this.api(`/api/v1/ai/stop/${this.aiFixTaskId}`, { method: 'POST' });
             if (this.aiFixEventSource) this.aiFixEventSource.close();
             this.aiFixLoading = false;
             this.aiFixLog.push({ type: 'status', message: 'Stopped by user' });
@@ -529,25 +508,20 @@ document.addEventListener('alpine:init', () => {
         },
 
         async loadCerts() {
-            // First trigger a check to populate the certificates list
             const status = await this.api('/api/v1/certificates/status');
-            // Then fetch the populated certificates
             const data = await this.api('/api/v1/certificates');
-            if (data) {
-                // Handle both array and object-with-array responses
-                this.certificates = Array.isArray(data) ? data : (data.certificates || data.certs || []);
-            }
+            if (data) this.certificates = Array.isArray(data) ? data : (data.certificates || data.certs || []);
         },
 
         async renewCert(name) {
-            if (!confirm(`Trigger renewal for certificate "${name}"? This will delete the TLS secret.`)) return;
+            if (!confirm(`Trigger renewal for "${name}"?`)) return;
             const data = await this.api(`/api/v1/certificates/${name}/renew`, { method: 'POST' });
             if (data) alert(JSON.stringify(data));
             await this.loadCerts();
         },
 
         async loadIssues() {
-            // Load issues for the dedicated Issues tab
+            if (this.issuesPageResult) return;
             await this.scanIssuesPage();
         },
 
@@ -565,15 +539,12 @@ document.addEventListener('alpine:init', () => {
         async scanIssues() {
             this.scanningIssues = true;
             const data = await this.api('/api/v1/issues/scan', { method: 'POST' });
-            if (data) {
-                this.issueResult = data;
-                this.issueCount = data.total_issues || 0;
-            }
+            if (data) { this.issueResult = data; this.issueCount = data.total_issues || 0; }
             this.scanningIssues = false;
         },
 
         async analyzeAndFix(dryRun) {
-            if (!dryRun && !confirm('Execute AI auto-fix on production? Low-risk fixes will be executed.')) return;
+            if (!dryRun && !confirm('Execute AI auto-fix on production?')) return;
             this.fixingIssues = true;
             this.aiFixResult = null;
             const data = await this.api(`/api/v1/issues/analyze-and-fix?dry_run=${dryRun}`, { method: 'POST' });
@@ -631,7 +602,7 @@ document.addEventListener('alpine:init', () => {
         },
 
         async executePlaybook(name, dryRun) {
-            if (!dryRun && !confirm(`Execute playbook "${name}" for real? This will take actions.`)) return;
+            if (!dryRun && !confirm(`Execute "${name}" for real?`)) return;
             const data = await this.api('/api/v1/remediation/execute', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -641,41 +612,62 @@ document.addEventListener('alpine:init', () => {
         },
 
         // --- Log Monitor ---
+        _logMonitorLoaded: false,
+
         async loadLogMonitor() {
-            await this.scanLogMonitor();
+            if (this._logMonitorLoaded) {
+                await this.loadLogMonitorTickets();
+                return;
+            }
+            this._logMonitorLoaded = true;
+            await this.fetchLogMonitorData('/api/v1/logmonitor/latest');
             await this.loadLogMonitorTickets();
-            // Start auto-scan watcher
-            this.$watch('logMonitorAutoScan', (val) => {
-                if (val && !this.logMonitorInterval) {
-                    this.logMonitorInterval = setInterval(() => this.scanLogMonitor(), 60000);
-                } else if (!val && this.logMonitorInterval) {
-                    clearInterval(this.logMonitorInterval);
-                    this.logMonitorInterval = null;
-                }
-            });
+            if (!this.logMonitorInterval) {
+                this.logMonitorInterval = setInterval(() => {
+                    this._mergeLogMonitorData('/api/v1/logmonitor/latest');
+                    this.loadLogMonitorTickets();
+                }, 30000);
+            }
         },
 
         async scanLogMonitor() {
             this.logMonitorScanning = true;
-            const data = await this.api('/api/v1/logmonitor/scan', { method: 'POST' });
+            await this.fetchLogMonitorData('/api/v1/logmonitor/scan', { method: 'POST' });
+            this.logMonitorScanning = false;
+        },
+
+        async fetchLogMonitorData(url, options = {}) {
+            const data = await this.api(url, options);
             if (data) {
                 this.logMonitorServices = data.services || [];
                 this.logMonitorIssues = (data.issues || []).map(i => ({
-                    ...i,
-                    _ticketCreated: false,
-                    _ticket: null,
-                    _diagnosing: false,
-                    _diagResult: null,
+                    ...i, _ticketCreated: false, _ticket: null, _diagnosing: false, _diagResult: null,
                 }));
-                this.logMonitorLastScan = new Date().toISOString();
-                // Auto-select first service with issues
+                this.logMonitorLastScan = data.scanned_at || new Date().toISOString();
                 if (!this.logMonitorSelectedSvc) {
                     const withIssues = this.logMonitorServices.find(s => s.issueCount > 0);
                     if (withIssues) this.logMonitorSelectedSvc = withIssues.name;
                     else if (this.logMonitorServices.length) this.logMonitorSelectedSvc = this.logMonitorServices[0].name;
                 }
             }
-            this.logMonitorScanning = false;
+        },
+
+        async _mergeLogMonitorData(url) {
+            const data = await this.api(url);
+            if (!data) return;
+            this.logMonitorServices = data.services || [];
+            this.logMonitorLastScan = data.scanned_at || new Date().toISOString();
+            const newIssues = data.issues || [];
+            const existing = {};
+            for (const i of this.logMonitorIssues) {
+                existing[i.service + '|' + i.category + '|' + i.description] = i;
+            }
+            this.logMonitorIssues = newIssues.map(i => {
+                const key = i.service + '|' + i.category + '|' + i.description;
+                const prev = existing[key];
+                if (prev) return { ...i, _ticketCreated: prev._ticketCreated, _ticket: prev._ticket, _diagnosing: prev._diagnosing, _diagResult: prev._diagResult };
+                return { ...i, _ticketCreated: false, _ticket: null, _diagnosing: false, _diagResult: null };
+            });
         },
 
         async loadLogMonitorTickets() {
@@ -694,18 +686,16 @@ document.addEventListener('alpine:init', () => {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    service: issue.service,
-                    namespace: issue.namespace || 'default',
-                    severity: issue.severity,
-                    category: issue.category,
-                    description: issue.description,
-                    matched_line: issue.matched_line,
+                    service: issue.service, namespace: issue.namespace || 'default',
+                    severity: issue.severity, category: issue.category,
+                    description: issue.description, matched_line: issue.matched_line,
                     recommendation: issue.recommendation || '',
                 }),
             });
             if (data?.ticket) {
                 issue._ticket = data.ticket;
                 this.logMonitorTickets.unshift(data.ticket);
+                this.loadTicketStats();
             }
         },
 
@@ -715,18 +705,187 @@ document.addEventListener('alpine:init', () => {
             const data = await this.api('/api/v1/logmonitor/diagnose', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    service: issue.service,
-                    description: issue.description,
-                    matched_line: issue.matched_line,
-                }),
+                body: JSON.stringify({ service: issue.service, description: issue.description, matched_line: issue.matched_line }),
             });
-            if (data?.diagnosis) {
-                issue._diagResult = data.diagnosis;
-            }
+            if (data?.diagnosis) issue._diagResult = data.diagnosis;
             issue._diagnosing = false;
         },
 
+        // --- Tickets Tab ---
+        async resolveTicket(ticketId) {
+            await this.api(`/api/v1/logmonitor/tickets/${ticketId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status: 'resolved' }),
+            });
+            await this.loadTickets();
+        },
+
+        async reopenTicket(ticketId) {
+            await this.api(`/api/v1/logmonitor/tickets/${ticketId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status: 'investigating' }),
+            });
+            await this.loadTickets();
+        },
+
+        isDevopsTicket(ticket) {
+            return this._devopsCategories.includes(ticket.category);
+        },
+
+        filteredTickets() {
+            let list = this.ticketsList;
+            if (this.ticketViewType === 'devops') list = list.filter(t => this.isDevopsTicket(t));
+            else if (this.ticketViewType === 'app') list = list.filter(t => !this.isDevopsTicket(t));
+            return list;
+        },
+
+        async resetAllTickets() {
+            if (!confirm('Delete ALL tickets? This cannot be undone.')) return;
+            const data = await this.api('/api/v1/logmonitor/tickets', { method: 'DELETE' });
+            if (data) alert(`Deleted ${data.deleted} tickets`);
+            await this.loadTickets();
+        },
+
+        async aiFixTicket(ticketId) {
+            await this.api(`/api/v1/logmonitor/tickets/${ticketId}/ai-fix`, { method: 'POST' });
+            alert('AI fix dispatched for ticket #' + ticketId);
+            await this.loadTickets();
+        },
+
+        async loadTickets() {
+            const params = new URLSearchParams();
+            if (this.ticketFilterStatus) params.set('status', this.ticketFilterStatus);
+            if (this.ticketFilterSeverity) params.set('severity', this.ticketFilterSeverity);
+            if (this.ticketFilterService) params.set('service', this.ticketFilterService);
+            params.set('limit', '100');
+            const data = await this.api(`/api/v1/logmonitor/tickets?${params}`);
+            if (data) this.ticketsList = data;
+            await this.loadTicketStats();
+        },
+
+        async loadTicketStats() {
+            const data = await this.api('/api/v1/logmonitor/ticket-stats');
+            if (data) this.ticketStats = data;
+        },
+
+        // --- Overview AI Fix Modal ---
+        startOverviewAiFix(component, context) {
+            this.aiFixModal = { show: true, component, context, log: [], taskId: null, loading: false, result: null, msg: '', eventSource: null };
+        },
+
+        async runOverviewAiFix() {
+            const m = this.aiFixModal;
+            m.loading = true;
+            m.result = null;
+            m.log = [];
+            const issue = `Check the ${m.component} component for any issues, errors, or degraded performance. Investigate and fix if needed.`;
+            const data = await this.api('/api/v1/ai/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ issue, service: m.component, auto_fix: true }),
+            });
+            if (!data?.task_id) {
+                m.loading = false;
+                m.log.push({ type: 'error', message: 'Failed to start AI' });
+                return;
+            }
+            m.taskId = data.task_id;
+            const evtSource = new EventSource(`/api/v1/ai/stream/${data.task_id}`);
+            m.eventSource = evtSource;
+            evtSource.onmessage = (event) => {
+                try {
+                    const evt = JSON.parse(event.data);
+                    if (evt.type === 'done') {
+                        m.loading = false;
+                        m.result = evt.final_output || '';
+                        evtSource.close();
+                        return;
+                    }
+                    m.log.push(evt);
+                    if (m.log.length > 200) m.log.splice(0, 50);
+                } catch (e) { console.error('SSE parse:', e); }
+            };
+            evtSource.onerror = () => {
+                m.loading = false;
+                if (!m.result) m.log.push({ type: 'error', message: 'Connection lost' });
+                evtSource.close();
+            };
+        },
+
+        async sendOverviewAiMsg() {
+            const m = this.aiFixModal;
+            if (!m.taskId || !m.msg?.trim()) return;
+            const msg = m.msg;
+            m.msg = '';
+            m.log.push({ type: 'user', message: 'You: ' + msg });
+            await this.api(`/api/v1/ai/message/${m.taskId}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: msg }),
+            });
+            m.loading = true;
+        },
+
+        async stopOverviewAiFix() {
+            const m = this.aiFixModal;
+            if (m.taskId) await this.api(`/api/v1/ai/stop/${m.taskId}`, { method: 'POST' });
+            if (m.eventSource) m.eventSource.close();
+            m.loading = false;
+            m.log.push({ type: 'status', message: 'Stopped by user' });
+        },
+
+        // --- Issues sorted (critical first) ---
+        sortedServices() {
+            const svcs = this.services || [];
+            const order = { degraded: 0, unhealthy: 1, error: 2, warning: 3, healthy: 4, unknown: 5 };
+            return [...svcs].sort((a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3));
+        },
+
+        sortedIssues() {
+            const issues = this.issuesPageResult?.issues || [];
+            return [...issues].sort((a, b) => {
+                const order = { critical: 0, error: 1, warning: 2, info: 3 };
+                return (order[a.severity] ?? 4) - (order[b.severity] ?? 4);
+            });
+        },
+
+        // --- Passkey Registration ---
+        async registerPasskey() {
+            if (!window.PublicKeyCredential) {
+                alert('Your browser does not support passkeys');
+                return;
+            }
+            try {
+                const optResp = await fetch('/api/v1/auth/passkey/register-options', { method: 'POST' });
+                if (!optResp.ok) { alert('Failed to get registration options: ' + (await optResp.json()).detail); return; }
+                const opts = await optResp.json();
+                opts.challenge = this._b64ToArr(opts.challenge);
+                opts.user.id = this._b64ToArr(opts.user.id);
+                if (opts.excludeCredentials) opts.excludeCredentials = opts.excludeCredentials.map(c => ({...c, id: this._b64ToArr(c.id)}));
+                const cred = await navigator.credentials.create({ publicKey: opts });
+                const body = {
+                    id: cred.id,
+                    rawId: this._arrToB64(new Uint8Array(cred.rawId)),
+                    type: cred.type,
+                    response: {
+                        attestationObject: this._arrToB64(new Uint8Array(cred.response.attestationObject)),
+                        clientDataJSON: this._arrToB64(new Uint8Array(cred.response.clientDataJSON)),
+                    }
+                };
+                const vResp = await fetch('/api/v1/auth/passkey/register', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+                if (vResp.ok) { alert('Passkey registered successfully! You can now use it to log in.'); }
+                else { const e = await vResp.json(); alert('Registration failed: ' + (e.detail || 'Unknown error')); }
+            } catch (e) {
+                if (e.name === 'NotAllowedError') return;
+                alert('Passkey error: ' + e.message);
+            }
+        },
+        _b64ToArr(b) { const s = b.replace(/-/g, '+').replace(/_/g, '/'); const r = atob(s); const a = new Uint8Array(r.length); for (let i = 0; i < r.length; i++) a[i] = r.charCodeAt(i); return a.buffer; },
+        _arrToB64(a) { let s = ''; const b = new Uint8Array(a); for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, ''); },
+
+        // --- Utilities ---
         formatBytes(bytes) {
             if (!bytes) return '0 B';
             const k = 1024;
@@ -737,19 +896,55 @@ document.addEventListener('alpine:init', () => {
 
         formatAiAnalysis(text) {
             if (!text) return '';
-            // Escape HTML
             let safe = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            // Strip markdown code fences (```json ... ``` or ``` ... ```)
             safe = safe.replace(/```\w*\n?/g, '');
-            // Try to pretty-print JSON content
             try {
                 const parsed = JSON.parse(safe.trim());
-                safe = JSON.stringify(parsed, null, 2)
-                    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            } catch (e) {
-                // Not JSON, leave as-is
-            }
+                safe = JSON.stringify(parsed, null, 2).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            } catch (e) {}
             return safe;
+        },
+
+        // ---- Admin Tasks ----
+        async searchBusinesses() {
+            const q = this.adminSearch.trim();
+            if (q.length < 2) { this.adminSearchResults = []; this.adminDropdownOpen = false; return; }
+            const data = await this.api(`/api/v1/admin/search-businesses?q=${encodeURIComponent(q)}`);
+            this.adminSearchResults = data?.businesses || [];
+            this.adminDropdownOpen = this.adminSearchResults.length > 0;
+        },
+
+        selectAdminBusiness(b) {
+            this.adminSelectedBusiness = b;
+            this.adminSearch = b.businessName || '';
+            this.adminDropdownOpen = false;
+            this.adminCopyResult = null;
+        },
+
+        clearAdminBusiness() {
+            this.adminSelectedBusiness = null;
+            this.adminSearch = '';
+            this.adminSearchResults = [];
+            this.adminCopyResult = null;
+        },
+
+        async executeCopyCategories() {
+            const b = this.adminSelectedBusiness;
+            if (!b) return;
+            if (!confirm(`Copy categories to "${b.businessName}" (${b.businessCity})?\n\nBusiness ID: ${b.businessId}`)) return;
+            this.adminCopyLoading = true;
+            this.adminCopyResult = null;
+            const data = await this.api('/api/v1/admin/copy-categories', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ businessId: b.businessId, businessCity: b.businessCity }),
+            });
+            this.adminCopyLoading = false;
+            if (data?.success) {
+                this.adminCopyResult = { success: true, message: 'Categories copied successfully!' };
+            } else {
+                this.adminCopyResult = { success: false, message: 'Failed: ' + (data?.error || 'Unknown error') };
+            }
         },
     }));
 });
